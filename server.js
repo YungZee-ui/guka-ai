@@ -1,3 +1,8 @@
+const OpenAI = require("openai");
+
+const client = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
 const express = require("express");
 const bodyParser = require("body-parser");
 require("dotenv").config();
