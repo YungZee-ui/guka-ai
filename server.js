@@ -3,23 +3,28 @@ const bodyParser = require("body-parser");
 require("dotenv").config();
 
 const OpenAI = require("openai");
+const { createClient } = require("@supabase/supabase-js");
 
+const app = express();
+
+// OpenAI
 const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
 
-const app = express();
+// Supabase
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_KEY
+);
 
 // Middleware
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Simple in-memory memory store (resets on restart)
-const memory = {};
-
-// Health check (Render)
+// Health check
 app.get("/", (req, res) => {
-    res.status(200).send("Guka is running");
+    res.send("Guka is running");
 });
 
 // WhatsApp webhook
@@ -31,24 +36,39 @@ app.post("/webhook", async (req, res) => {
         console.log("User:", user);
         console.log("Message:", message);
 
-        // Create memory bucket for user
-        if (!memory[user]) {
-            memory[user] = [];
+        // 1. Save user message to Supabase
+        await supabase.from("messages").insert([
+            {
+                user_id: user,
+                role: "user",
+                content: message
+            }
+        ]);
+
+        // 2. Get last 20 messages for memory
+        const { data, error } = await supabase
+            .from("messages")
+            .select("*")
+            .eq("user_id", user)
+            .order("created_at", { ascending: true })
+            .limit(20);
+
+        if (error) {
+            console.error("Supabase error:", error);
         }
 
-        // Store user message
-        memory[user].push({ role: "user", content: message });
+        const recentMemory = (data || []).map(m => ({
+            role: m.role,
+            content: m.content
+        }));
 
-        // Keep last 10 messages only
-        const recentMemory = memory[user].slice(-10);
-
-        // AI request
+        // 3. Call OpenAI
         const completion = await client.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
                 {
                     role: "system",
-                    content: "You are Guka, a strict but supportive productivity coach. You help users stay focused, disciplined, and productive. Keep responses short, clear, and actionable. Remember user goals and follow up when relevant."
+                    content: "You are Guka, a strict but supportive productivity coach. You remember user goals and follow up on them. Keep responses short, direct, and actionable."
                 },
                 ...recentMemory
             ]
@@ -56,37 +76,38 @@ app.post("/webhook", async (req, res) => {
 
         const reply = completion.choices[0].message.content;
 
-        // Store AI response
-        memory[user].push({ role: "assistant", content: reply });
+        // 4. Save AI response
+        await supabase.from("messages").insert([
+            {
+                user_id: user,
+                role: "assistant",
+                content: reply
+            }
+        ]);
 
-        // Twilio response format
+        // 5. Respond to WhatsApp (Twilio XML)
         res.set("Content-Type", "text/xml");
-        res.status(200).send(`
+        res.send(`
 <Response>
     <Message>${reply}</Message>
 </Response>
         `);
 
     } catch (error) {
-        console.error("Webhook Error:", error);
+        console.error("Webhook error:", error);
 
         res.set("Content-Type", "text/xml");
-        res.status(200).send(`
+        res.send(`
 <Response>
-    <Message>Guka had an error. Try again.</Message>
+    <Message>Guka error. Try again.</Message>
 </Response>
         `);
     }
-});
-
-// 404 handler
-app.use((req, res) => {
-    res.status(404).send("Not found");
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Guka server running on port ${PORT}`);
+    console.log(`Guka running on port ${PORT}`);
 });
