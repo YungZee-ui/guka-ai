@@ -7,9 +7,6 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// ===============================
-// CLIENTS
-// ===============================
 const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
@@ -19,30 +16,15 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
-// ===============================
-// MIDDLEWARE
-// ===============================
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ===============================
-// HEALTH CHECK
-// ===============================
 app.get("/", (req, res) => {
     res.send("Guka is running");
 });
 
 // ===============================
-// MOTIVATION ENGINE
-// ===============================
-function getMotivation(streak) {
-    if (streak >= 7) return "Elite discipline. Don’t break the chain.";
-    if (streak >= 3) return "Good momentum. Keep going.";
-    return "Start small. One action today.";
-}
-
-// ===============================
-// WHATSAPP WEBHOOK
+// WEBHOOK
 // ===============================
 app.post("/webhook", async (req, res) => {
     try {
@@ -52,149 +34,125 @@ app.post("/webhook", async (req, res) => {
         let reply = "";
 
         // ===============================
-        // PERSONALITY SYSTEM
+        // CHECK USER PROFILE
         // ===============================
-        let mode = "balanced";
+        let { data: profile } = await supabase
+            .from("user_profiles")
+            .select("*")
+            .eq("user_id", user)
+            .single();
 
-        if (message.toLowerCase().startsWith("personality:")) {
-            mode = message.replace("personality:", "").trim();
+        // ===============================
+        // CREATE PROFILE IF NOT EXISTS
+        // ===============================
+        if (!profile) {
+            await supabase.from("user_profiles").insert([
+                {
+                    user_id: user,
+                    onboarding_complete: false
+                }
+            ]);
+
+            profile = { onboarding_complete: false };
+        }
+
+        // ===============================
+        // ONBOARDING FLOW
+        // ===============================
+        if (!profile.onboarding_complete) {
+
+            if (!profile.name) {
+                await supabase
+                    .from("user_profiles")
+                    .update({ name: message })
+                    .eq("user_id", user);
+
+                reply = "Nice. What’s your main goal?";
+            }
+
+            else if (!profile.main_goal) {
+                await supabase
+                    .from("user_profiles")
+                    .update({ main_goal: message })
+                    .eq("user_id", user);
+
+                reply = "Got it. What are you struggling with right now?";
+            }
+
+            else if (!profile.struggle) {
+                await supabase
+                    .from("user_profiles")
+                    .update({ struggle: message, onboarding_complete: true })
+                    .eq("user_id", user);
+
+                reply = "Perfect. I’ve got you now. Let’s get to work.";
+            }
 
             res.set("Content-Type", "text/xml");
             return res.send(`
 <Response>
-    <Message>Personality set to: ${mode}</Message>
+    <Message>${reply}</Message>
 </Response>
             `);
         }
 
         // ===============================
-        // SYSTEM PROMPT (PERSONALITY)
+        // NORMAL AI MODE (AFTER ONBOARDING)
         // ===============================
-        let systemPrompt = "";
+        const { data: memory } = await supabase
+            .from("messages")
+            .select("*")
+            .eq("user_id", user)
+            .order("created_at", { ascending: true })
+            .limit(20);
 
-        if (mode === "strict") {
-            systemPrompt =
-                "You are Guka. Extremely direct, no excuses, push discipline hard. Use slight modern slang.";
-        } 
-        else if (mode === "chill") {
-            systemPrompt =
-                "You are Guka. Friendly, relaxed, supportive Gen Z tone.";
-        } 
-        else {
-            systemPrompt =
-                "You are Guka. A 20-year-old brutally honest but friendly productivity coach. Use light modern slang, be direct, no fluff.";
-        }
+        const { data: userData } = await supabase
+            .from("user_profiles")
+            .select("*")
+            .eq("user_id", user)
+            .single();
 
-        // ===============================
-        // GOAL CREATION
-        // ===============================
-        if (message.toLowerCase().startsWith("goal:")) {
-            const goalText = message.replace("goal:", "").trim();
+        const systemPrompt = `
+You are Guka.
 
-            await supabase.from("goals").insert([
-                { user_id: user, goal: goalText }
-            ]);
+User info:
+- Name: ${userData?.name}
+- Main goal: ${userData?.main_goal}
+- Struggle: ${userData?.struggle}
 
-            await supabase.from("streaks").upsert({
+Personality:
+- 20-year-old Gen Z productivity coach
+- brutally honest but friendly
+- modern slang
+- short messages
+- pushes discipline
+`;
+
+        const completion = await client.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                ...(memory || []).map(m => ({
+                    role: m.role,
+                    content: m.content
+                })),
+                { role: "user", content: message }
+            ]
+        });
+
+        reply = completion.choices[0].message.content;
+
+        await supabase.from("messages").insert([
+            {
                 user_id: user,
-                goal: goalText,
-                streak_count: 0,
-                last_updated: new Date().toISOString().split("T")[0]
-            });
-
-            reply = `Goal set: ${goalText}`;
-        }
-
-        // ===============================
-        // MARK DONE (STREAK SYSTEM)
-        // ===============================
-        else if (message.toLowerCase().startsWith("done:")) {
-            const goalText = message.replace("done:", "").trim();
-
-            const { data } = await supabase
-                .from("streaks")
-                .select("*")
-                .eq("user_id", user)
-                .eq("goal", goalText)
-                .single();
-
-            if (!data) {
-                reply = "Goal not found. Create it first.";
-            } else {
-                const today = new Date().toISOString().split("T")[0];
-
-                let streak = data.streak_count;
-
-                if (data.last_updated !== today) {
-                    streak += 1;
-                }
-
-                await supabase
-                    .from("streaks")
-                    .update({
-                        streak_count: streak,
-                        last_updated: today
-                    })
-                    .eq("id", data.id);
-
-                reply = `🔥 Streak: ${streak} days\n${getMotivation(streak)}`;
+                role: "assistant",
+                content: reply
             }
-        }
+        ]);
 
-        // ===============================
-        // VIEW GOALS
-        // ===============================
-        else if (message.toLowerCase().includes("my goals")) {
-            const { data } = await supabase
-                .from("streaks")
-                .select("*")
-                .eq("user_id", user);
-
-            const list = (data || [])
-                .map(g => `- ${g.goal} | 🔥 ${g.streak_count} days`)
-                .join("\n");
-
-            reply = list ? `Your goals:\n${list}` : "No goals yet.";
-        }
-
-        // ===============================
-        // AI MEMORY CHAT (FALLBACK)
-        // ===============================
-        else {
-            const { data } = await supabase
-                .from("messages")
-                .select("*")
-                .eq("user_id", user)
-                .order("created_at", { ascending: true })
-                .limit(20);
-
-            const memory = (data || []).map(m => ({
-                role: m.role,
-                content: m.content
-            }));
-
-            const completion = await client.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: [
-                    {
-                        role: "system",
-                        content: systemPrompt
-                    },
-                    ...memory,
-                    { role: "user", content: message }
-                ]
-            });
-
-            reply = completion.choices[0].message.content;
-
-            await supabase.from("messages").insert([
-                { user_id: user, role: "assistant", content: reply }
-            ]);
-        }
-
-        // ===============================
-        // RESPONSE
-        // ===============================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -207,7 +165,7 @@ app.post("/webhook", async (req, res) => {
 
         res.send(`
 <Response>
-    <Message>Guka error. Try again.</Message>
+    <Message>Guka error</Message>
 </Response>
         `);
     }
@@ -217,5 +175,5 @@ app.post("/webhook", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Guka running on port ${PORT}`);
+    console.log("Guka running");
 });
