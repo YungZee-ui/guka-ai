@@ -10,42 +10,56 @@ const client = new OpenAI({
 
 const app = express();
 
-// Twilio sends data as URL-encoded form
+// Middleware
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Health check route (Render + browser test)
+// Simple in-memory memory store (resets on restart)
+const memory = {};
+
+// Health check (Render)
 app.get("/", (req, res) => {
     res.status(200).send("Guka is running");
 });
 
-// WhatsApp webhook (MAIN LOGIC)
+// WhatsApp webhook
 app.post("/webhook", async (req, res) => {
     try {
-        const incomingMessage = req.body.Body || "";
-        const userNumber = req.body.From || "unknown";
+        const user = req.body.From || "unknown";
+        const message = req.body.Body || "";
 
-        console.log("User:", userNumber);
-        console.log("Message:", incomingMessage);
+        console.log("User:", user);
+        console.log("Message:", message);
 
-        // AI response (OpenAI)
+        // Create memory bucket for user
+        if (!memory[user]) {
+            memory[user] = [];
+        }
+
+        // Store user message
+        memory[user].push({ role: "user", content: message });
+
+        // Keep last 10 messages only
+        const recentMemory = memory[user].slice(-10);
+
+        // AI request
         const completion = await client.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
                 {
                     role: "system",
-                    content: "You are Guka, a strict but supportive productivity coach. You help users stay focused, disciplined, and productive. Keep responses short and actionable."
+                    content: "You are Guka, a strict but supportive productivity coach. You help users stay focused, disciplined, and productive. Keep responses short, clear, and actionable. Remember user goals and follow up when relevant."
                 },
-                {
-                    role: "user",
-                    content: incomingMessage
-                }
+                ...recentMemory
             ]
         });
 
         const reply = completion.choices[0].message.content;
 
-        // Twilio requires XML response
+        // Store AI response
+        memory[user].push({ role: "assistant", content: reply });
+
+        // Twilio response format
         res.set("Content-Type", "text/xml");
         res.status(200).send(`
 <Response>
@@ -59,18 +73,18 @@ app.post("/webhook", async (req, res) => {
         res.set("Content-Type", "text/xml");
         res.status(200).send(`
 <Response>
-    <Message>Guka is having trouble thinking right now. Try again.</Message>
+    <Message>Guka had an error. Try again.</Message>
 </Response>
         `);
     }
 });
 
-// Handle unknown routes
+// 404 handler
 app.use((req, res) => {
     res.status(404).send("Not found");
 });
 
-// Start server (Render compatible)
+// Start server
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
