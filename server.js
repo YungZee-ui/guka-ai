@@ -4,8 +4,6 @@ require("dotenv").config();
 
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
-const cron = require("node-cron");
-const axios = require("axios");
 
 const app = express();
 
@@ -19,11 +17,6 @@ const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
 );
-
-// Twilio credentials
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 
 // Middleware
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -44,13 +37,9 @@ app.post("/webhook", async (req, res) => {
 
         let reply = "";
 
-        // Save user if new
-        await supabase.from("users").upsert({
-            user_id: user,
-            last_checkin: new Date()
-        });
-
-        // Goal handling
+        // ===========================
+        // 1. CREATE GOAL
+        // ===========================
         if (message.toLowerCase().startsWith("goal:")) {
             const goalText = message.replace("goal:", "").trim();
 
@@ -58,22 +47,73 @@ app.post("/webhook", async (req, res) => {
                 { user_id: user, goal: goalText }
             ]);
 
-            reply = `Goal saved: ${goalText}`;
+            // create streak entry
+            await supabase.from("streaks").upsert({
+                user_id: user,
+                goal: goalText,
+                streak_count: 0,
+                last_updated: new Date()
+            });
+
+            reply = `Goal added: ${goalText}`;
         }
 
-        else if (message.toLowerCase().includes("my goals")) {
+        // ===========================
+        // 2. COMPLETE GOAL (STREAK LOGIC)
+        // ===========================
+        else if (message.toLowerCase().startsWith("done:")) {
+            const goalText = message.replace("done:", "").trim();
+
             const { data } = await supabase
-                .from("goals")
+                .from("streaks")
                 .select("*")
                 .eq("user_id", user)
-                .eq("status", "active");
+                .eq("goal", goalText)
+                .single();
 
-            const list = (data || []).map(g => `- ${g.goal}`).join("\n");
+            if (data) {
+                const today = new Date().toISOString().split("T")[0];
+                const last = data.last_updated;
+
+                let newStreak = data.streak_count;
+
+                if (last !== today) {
+                    newStreak += 1;
+                }
+
+                await supabase
+                    .from("streaks")
+                    .update({
+                        streak_count: newStreak,
+                        last_updated: today
+                    })
+                    .eq("id", data.id);
+
+                reply = `Good job! 🔥 Streak for "${goalText}" is now ${newStreak} days.`;
+            } else {
+                reply = "Goal not found. Use goal: to create it first.";
+            }
+        }
+
+        // ===========================
+        // 3. VIEW GOALS + STREAKS
+        // ===========================
+        else if (message.toLowerCase().includes("my goals")) {
+            const { data } = await supabase
+                .from("streaks")
+                .select("*")
+                .eq("user_id", user);
+
+            const list = (data || [])
+                .map(g => `- ${g.goal} | 🔥 ${g.streak_count} day streak`)
+                .join("\n");
 
             reply = list ? `Your goals:\n${list}` : "No goals yet.";
         }
 
-        // AI fallback
+        // ===========================
+        // 4. AI CHAT (FALLBACK)
+        // ===========================
         else {
             const { data } = await supabase
                 .from("messages")
@@ -92,7 +132,7 @@ app.post("/webhook", async (req, res) => {
                 messages: [
                     {
                         role: "system",
-                        content: "You are Guka, a strict productivity coach. Keep responses short."
+                        content: "You are Guka, a strict productivity coach. Push users to build consistency and streaks. Keep responses short."
                     },
                     ...memory,
                     { role: "user", content: message }
@@ -106,6 +146,9 @@ app.post("/webhook", async (req, res) => {
             ]);
         }
 
+        // ===========================
+        // RESPONSE
+        // ===========================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -121,41 +164,6 @@ app.post("/webhook", async (req, res) => {
     <Message>Error</Message>
 </Response>
         `);
-    }
-});
-
-// ===============================
-// DAILY CHECK-IN SYSTEM
-// ===============================
-cron.schedule("0 9 * * *", async () => {
-    console.log("Running daily check-ins...");
-
-    const { data: users } = await supabase.from("users").select("*");
-
-    if (!users) return;
-
-    for (const user of users) {
-        const message = "Daily Check-in: What are you focusing on today? Reply with your goals.";
-
-        try {
-            await axios.post(
-                `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
-                new URLSearchParams({
-                    To: user.user_id,
-                    From: TWILIO_NUMBER,
-                    Body: message
-                }),
-                {
-                    auth: {
-                        username: TWILIO_ACCOUNT_SID,
-                        password: TWILIO_AUTH_TOKEN
-                    }
-                }
-            );
-
-        } catch (err) {
-            console.error("Check-in failed for:", user.user_id);
-        }
     }
 });
 
