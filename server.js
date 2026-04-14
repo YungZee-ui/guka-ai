@@ -4,32 +4,30 @@ require("dotenv").config();
 
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
-const cron = require("node-cron");
-const axios = require("axios");
 
 const app = express();
 
-// OpenAI
+// ===============================
+// CLIENTS
+// ===============================
 const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
 
-// Supabase
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
 );
 
-// Twilio config
-const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
-
-// Middleware
+// ===============================
+// MIDDLEWARE
+// ===============================
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Health check
+// ===============================
+// HEALTH CHECK
+// ===============================
 app.get("/", (req, res) => {
     res.send("Guka is running");
 });
@@ -53,13 +51,43 @@ app.post("/webhook", async (req, res) => {
 
         let reply = "";
 
-        // Save user activity (for inactivity tracking)
-        await supabase.from("users").upsert({
-            user_id: user,
-            last_active: new Date().toISOString()
-        });
+        // ===============================
+        // PERSONALITY SYSTEM
+        // ===============================
+        let mode = "balanced";
 
-        // GOAL CREATE
+        if (message.toLowerCase().startsWith("personality:")) {
+            mode = message.replace("personality:", "").trim();
+
+            res.set("Content-Type", "text/xml");
+            return res.send(`
+<Response>
+    <Message>Personality set to: ${mode}</Message>
+</Response>
+            `);
+        }
+
+        // ===============================
+        // SYSTEM PROMPT (PERSONALITY)
+        // ===============================
+        let systemPrompt = "";
+
+        if (mode === "strict") {
+            systemPrompt =
+                "You are Guka. Extremely direct, no excuses, push discipline hard. Use slight modern slang.";
+        } 
+        else if (mode === "chill") {
+            systemPrompt =
+                "You are Guka. Friendly, relaxed, supportive Gen Z tone.";
+        } 
+        else {
+            systemPrompt =
+                "You are Guka. A 20-year-old brutally honest but friendly productivity coach. Use light modern slang, be direct, no fluff.";
+        }
+
+        // ===============================
+        // GOAL CREATION
+        // ===============================
         if (message.toLowerCase().startsWith("goal:")) {
             const goalText = message.replace("goal:", "").trim();
 
@@ -77,7 +105,9 @@ app.post("/webhook", async (req, res) => {
             reply = `Goal set: ${goalText}`;
         }
 
-        // DONE
+        // ===============================
+        // MARK DONE (STREAK SYSTEM)
+        // ===============================
         else if (message.toLowerCase().startsWith("done:")) {
             const goalText = message.replace("done:", "").trim();
 
@@ -89,7 +119,7 @@ app.post("/webhook", async (req, res) => {
                 .single();
 
             if (!data) {
-                reply = "Goal not found.";
+                reply = "Goal not found. Create it first.";
             } else {
                 const today = new Date().toISOString().split("T")[0];
 
@@ -111,7 +141,9 @@ app.post("/webhook", async (req, res) => {
             }
         }
 
+        // ===============================
         // VIEW GOALS
+        // ===============================
         else if (message.toLowerCase().includes("my goals")) {
             const { data } = await supabase
                 .from("streaks")
@@ -119,13 +151,15 @@ app.post("/webhook", async (req, res) => {
                 .eq("user_id", user);
 
             const list = (data || [])
-                .map(g => `- ${g.goal} | 🔥 ${g.streak_count}`)
+                .map(g => `- ${g.goal} | 🔥 ${g.streak_count} days`)
                 .join("\n");
 
             reply = list ? `Your goals:\n${list}` : "No goals yet.";
         }
 
-        // AI fallback
+        // ===============================
+        // AI MEMORY CHAT (FALLBACK)
+        // ===============================
         else {
             const { data } = await supabase
                 .from("messages")
@@ -144,7 +178,7 @@ app.post("/webhook", async (req, res) => {
                 messages: [
                     {
                         role: "system",
-                        content: "You are Guka, a strict discipline coach. Push users to take action and build consistency."
+                        content: systemPrompt
                     },
                     ...memory,
                     { role: "user", content: message }
@@ -152,8 +186,15 @@ app.post("/webhook", async (req, res) => {
             });
 
             reply = completion.choices[0].message.content;
+
+            await supabase.from("messages").insert([
+                { user_id: user, role: "assistant", content: reply }
+            ]);
         }
 
+        // ===============================
+        // RESPONSE
+        // ===============================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -166,51 +207,9 @@ app.post("/webhook", async (req, res) => {
 
         res.send(`
 <Response>
-    <Message>Error</Message>
+    <Message>Guka error. Try again.</Message>
 </Response>
         `);
-    }
-});
-
-// ===============================
-// PROACTIVE MOTIVATION SYSTEM
-// ===============================
-cron.schedule("0 18 * * *", async () => {
-    console.log("Running proactive motivation...");
-
-    const { data: users } = await supabase.from("users").select("*");
-
-    if (!users) return;
-
-    for (const u of users) {
-        const lastActive = new Date(u.last_active || 0);
-        const now = new Date();
-
-        const hoursInactive = (now - lastActive) / (1000 * 60 * 60);
-
-        // If inactive for 6+ hours → send motivation
-        if (hoursInactive >= 6) {
-            const message = "Guka check-in: You’re off track. Take one action right now. Discipline is built today.";
-
-            try {
-                await axios.post(
-                    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`,
-                    new URLSearchParams({
-                        To: u.user_id,
-                        From: TWILIO_NUMBER,
-                        Body: message
-                    }),
-                    {
-                        auth: {
-                            username: TWILIO_SID,
-                            password: TWILIO_AUTH
-                        }
-                    }
-                );
-            } catch (err) {
-                console.error("Failed to message:", u.user_id);
-            }
-        }
     }
 });
 
