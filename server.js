@@ -27,7 +27,9 @@ app.get("/", (req, res) => {
     res.send("Guka is running");
 });
 
-// WhatsApp webhook
+// ===============================
+// WHATSAPP WEBHOOK (CORE LOGIC)
+// ===============================
 app.post("/webhook", async (req, res) => {
     try {
         const user = req.body.From || "unknown";
@@ -36,56 +38,95 @@ app.post("/webhook", async (req, res) => {
         console.log("User:", user);
         console.log("Message:", message);
 
-        // 1. Save user message to Supabase
-        await supabase.from("messages").insert([
-            {
-                user_id: user,
-                role: "user",
-                content: message
-            }
-        ]);
+        let reply = "";
 
-        // 2. Get last 20 messages for memory
-        const { data, error } = await supabase
-            .from("messages")
-            .select("*")
-            .eq("user_id", user)
-            .order("created_at", { ascending: true })
-            .limit(20);
+        // ===========================
+        // 1. CREATE GOAL
+        // ===========================
+        if (message.toLowerCase().startsWith("goal:")) {
+            const goalText = message.replace("goal:", "").trim();
 
-        if (error) {
-            console.error("Supabase error:", error);
+            await supabase.from("goals").insert([
+                {
+                    user_id: user,
+                    goal: goalText
+                }
+            ]);
+
+            reply = `Goal saved: ${goalText}`;
         }
 
-        const recentMemory = (data || []).map(m => ({
-            role: m.role,
-            content: m.content
-        }));
+        // ===========================
+        // 2. VIEW GOALS
+        // ===========================
+        else if (message.toLowerCase().includes("my goals")) {
+            const { data } = await supabase
+                .from("goals")
+                .select("*")
+                .eq("user_id", user)
+                .eq("status", "active");
 
-        // 3. Call OpenAI
-        const completion = await client.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
+            const list = (data || [])
+                .map(g => `- ${g.goal}`)
+                .join("\n");
+
+            reply = list ? `Your goals:\n${list}` : "You have no goals yet.";
+        }
+
+        // ===========================
+        // 3. AI CHAT + MEMORY
+        // ===========================
+        else {
+            // Save message to DB
+            await supabase.from("messages").insert([
                 {
-                    role: "system",
-                    content: "You are Guka, a strict but supportive productivity coach. You remember user goals and follow up on them. Keep responses short, direct, and actionable."
-                },
-                ...recentMemory
-            ]
-        });
+                    user_id: user,
+                    role: "user",
+                    content: message
+                }
+            ]);
 
-        const reply = completion.choices[0].message.content;
+            // Get memory
+            const { data } = await supabase
+                .from("messages")
+                .select("*")
+                .eq("user_id", user)
+                .order("created_at", { ascending: true })
+                .limit(20);
 
-        // 4. Save AI response
-        await supabase.from("messages").insert([
-            {
-                user_id: user,
-                role: "assistant",
-                content: reply
-            }
-        ]);
+            const memory = (data || []).map(m => ({
+                role: m.role,
+                content: m.content
+            }));
 
-        // 5. Respond to WhatsApp (Twilio XML)
+            // AI response
+            const completion = await client.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are Guka, a strict but supportive productivity coach. You help users stay disciplined, achieve goals, and avoid procrastination. Keep responses short and actionable."
+                    },
+                    ...memory,
+                    { role: "user", content: message }
+                ]
+            });
+
+            reply = completion.choices[0].message.content;
+
+            // Save AI response
+            await supabase.from("messages").insert([
+                {
+                    user_id: user,
+                    role: "assistant",
+                    content: reply
+                }
+            ]);
+        }
+
+        // ===========================
+        // TWILIO RESPONSE
+        // ===========================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -94,7 +135,7 @@ app.post("/webhook", async (req, res) => {
         `);
 
     } catch (error) {
-        console.error("Webhook error:", error);
+        console.error("Webhook Error:", error);
 
         res.set("Content-Type", "text/xml");
         res.send(`
@@ -105,7 +146,9 @@ app.post("/webhook", async (req, res) => {
     }
 });
 
-// Start server
+// ===============================
+// START SERVER
+// ===============================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
