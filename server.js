@@ -4,6 +4,8 @@ require("dotenv").config();
 
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
+const cron = require("node-cron");
+const axios = require("axios");
 
 const app = express();
 
@@ -18,6 +20,11 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
+// Twilio config
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
+
 // Middleware
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
@@ -28,16 +35,12 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
-// MOTIVATION ENGINE (CORE LOGIC)
+// MOTIVATION ENGINE
 // ===============================
 function getMotivation(streak) {
-    if (streak >= 7) {
-        return "You are building elite discipline. Don’t break the chain now.";
-    }
-    if (streak >= 3) {
-        return "Good momentum. Keep going — consistency is forming.";
-    }
-    return "Start small today. Discipline is built one action at a time.";
+    if (streak >= 7) return "Elite discipline. Don’t break the chain.";
+    if (streak >= 3) return "Good momentum. Keep going.";
+    return "Start small. One action today.";
 }
 
 // ===============================
@@ -50,9 +53,13 @@ app.post("/webhook", async (req, res) => {
 
         let reply = "";
 
-        // ===========================
-        // CREATE GOAL
-        // ===========================
+        // Save user activity (for inactivity tracking)
+        await supabase.from("users").upsert({
+            user_id: user,
+            last_active: new Date().toISOString()
+        });
+
+        // GOAL CREATE
         if (message.toLowerCase().startsWith("goal:")) {
             const goalText = message.replace("goal:", "").trim();
 
@@ -70,9 +77,7 @@ app.post("/webhook", async (req, res) => {
             reply = `Goal set: ${goalText}`;
         }
 
-        // ===========================
-        // MARK COMPLETED (STREAK + MOTIVATION)
-        // ===========================
+        // DONE
         else if (message.toLowerCase().startsWith("done:")) {
             const goalText = message.replace("done:", "").trim();
 
@@ -84,7 +89,7 @@ app.post("/webhook", async (req, res) => {
                 .single();
 
             if (!data) {
-                reply = "Goal not found. Create it first using goal:";
+                reply = "Goal not found.";
             } else {
                 const today = new Date().toISOString().split("T")[0];
 
@@ -102,15 +107,11 @@ app.post("/webhook", async (req, res) => {
                     })
                     .eq("id", data.id);
 
-                const motivation = getMotivation(streak);
-
-                reply = `🔥 Streak: ${streak} days\n${motivation}`;
+                reply = `🔥 Streak: ${streak} days\n${getMotivation(streak)}`;
             }
         }
 
-        // ===========================
         // VIEW GOALS
-        // ===========================
         else if (message.toLowerCase().includes("my goals")) {
             const { data } = await supabase
                 .from("streaks")
@@ -118,15 +119,13 @@ app.post("/webhook", async (req, res) => {
                 .eq("user_id", user);
 
             const list = (data || [])
-                .map(g => `- ${g.goal} | 🔥 ${g.streak_count} days`)
+                .map(g => `- ${g.goal} | 🔥 ${g.streak_count}`)
                 .join("\n");
 
             reply = list ? `Your goals:\n${list}` : "No goals yet.";
         }
 
-        // ===========================
-        // AI CHAT FALLBACK
-        // ===========================
+        // AI fallback
         else {
             const { data } = await supabase
                 .from("messages")
@@ -145,7 +144,7 @@ app.post("/webhook", async (req, res) => {
                 messages: [
                     {
                         role: "system",
-                        content: "You are Guka, a strict discipline coach. You push users to act, build habits, and maintain streaks. Be direct and motivational."
+                        content: "You are Guka, a strict discipline coach. Push users to take action and build consistency."
                     },
                     ...memory,
                     { role: "user", content: message }
@@ -153,15 +152,8 @@ app.post("/webhook", async (req, res) => {
             });
 
             reply = completion.choices[0].message.content;
-
-            await supabase.from("messages").insert([
-                { user_id: user, role: "assistant", content: reply }
-            ]);
         }
 
-        // ===========================
-        // RESPONSE
-        // ===========================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -174,14 +166,54 @@ app.post("/webhook", async (req, res) => {
 
         res.send(`
 <Response>
-    <Message>Guka error. Try again.</Message>
+    <Message>Error</Message>
 </Response>
         `);
     }
 });
 
 // ===============================
-// START SERVER
+// PROACTIVE MOTIVATION SYSTEM
+// ===============================
+cron.schedule("0 18 * * *", async () => {
+    console.log("Running proactive motivation...");
+
+    const { data: users } = await supabase.from("users").select("*");
+
+    if (!users) return;
+
+    for (const u of users) {
+        const lastActive = new Date(u.last_active || 0);
+        const now = new Date();
+
+        const hoursInactive = (now - lastActive) / (1000 * 60 * 60);
+
+        // If inactive for 6+ hours → send motivation
+        if (hoursInactive >= 6) {
+            const message = "Guka check-in: You’re off track. Take one action right now. Discipline is built today.";
+
+            try {
+                await axios.post(
+                    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`,
+                    new URLSearchParams({
+                        To: u.user_id,
+                        From: TWILIO_NUMBER,
+                        Body: message
+                    }),
+                    {
+                        auth: {
+                            username: TWILIO_SID,
+                            password: TWILIO_AUTH
+                        }
+                    }
+                );
+            } catch (err) {
+                console.error("Failed to message:", u.user_id);
+            }
+        }
+    }
+});
+
 // ===============================
 const PORT = process.env.PORT || 3000;
 
