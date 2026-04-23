@@ -42,7 +42,6 @@ app.post("/webhook", async (req, res) => {
             .eq("user_id", user)
             .single();
 
-        // CREATE USER
         if (!profile) {
             await supabase.from("user_profiles").insert([
                 { user_id: user, step: "name" }
@@ -51,7 +50,15 @@ app.post("/webhook", async (req, res) => {
         }
 
         // ===============================
-        // ONBOARDING (CONVERSATIONAL)
+        // SAVE LAST ACTIVE
+        // ===============================
+        await supabase
+            .from("user_profiles")
+            .update({ last_active: new Date().toISOString() })
+            .eq("user_id", user);
+
+        // ===============================
+        // ONBOARDING
         // ===============================
         if (!profile.onboarding_complete) {
 
@@ -59,111 +66,41 @@ app.post("/webhook", async (req, res) => {
             let updates = {};
             let systemPrompt = "";
 
-            // ===============================
-            // STEP: NAME
-            // ===============================
             if (profile.step === "name") {
-
                 if (!profile.name) {
                     reply = "hey 🙂 what's your name?";
-                    nextStep = "name";
                 } else {
                     updates = { name: message };
                     nextStep = "age";
 
-                    systemPrompt = `
-You are Guka.
-
-Reply like a human friend meeting someone new.
-React to their name naturally, slightly playful.
-
-Then smoothly ask for their age.
-Do NOT sound like a form.
-`;
-
+                    systemPrompt = "React to their name naturally, then ask age casually.";
                 }
             }
 
-            // ===============================
-            // STEP: AGE
-            // ===============================
             else if (profile.step === "age") {
-
                 updates = { age: message };
                 nextStep = "goal";
 
-                systemPrompt = `
-You are Guka.
-
-React to the user's age casually.
-Then naturally transition into asking about their goals.
-
-Style:
-- relaxed
-- slightly teasing
-- like a peer
-- not robotic
-
-Combine reaction + question naturally.
-`;
+                systemPrompt = "React to age casually, then ask their goal.";
             }
 
-            // ===============================
-            // STEP: GOAL
-            // ===============================
             else if (profile.step === "goal") {
-
                 updates = { main_goal: message };
                 nextStep = "struggle";
 
-                systemPrompt = `
-You are Guka.
-
-User just told you their goal.
-
-Respond like:
-- you understand ambition
-- slight challenge tone
-- not impressed too easily
-
-Then ask:
-What's actually stopping them?
-
-Keep it conversational, not interview-like.
-`;
+                systemPrompt = "Be slightly skeptical, then ask what’s holding them back.";
             }
 
-            // ===============================
-            // STEP: STRUGGLE
-            // ===============================
             else if (profile.step === "struggle") {
-
                 updates = {
                     struggle: message,
                     onboarding_complete: true
                 };
                 nextStep = "done";
 
-                systemPrompt = `
-You are Guka.
-
-User just told you what's holding them back.
-
-Respond like:
-- you see through them
-- calm but sharp
-- slightly confrontational (not rude)
-
-Then end onboarding with something like:
-"alright... now we fix it"
-
-Keep it short and powerful.
-`;
+                systemPrompt = "Acknowledge struggle, challenge them, end with strong line.";
             }
 
-            // ===============================
-            // AI RESPONSE (for onboarding steps except first)
-            // ===============================
             if (systemPrompt) {
                 const completion = await client.chat.completions.create({
                     model: "gpt-4o-mini",
@@ -176,22 +113,122 @@ Keep it short and powerful.
                 reply = completion.choices[0].message.content;
             }
 
-            // SAVE DATA + STEP
             await supabase
                 .from("user_profiles")
-                .update({
-                    ...updates,
-                    step: nextStep
-                })
+                .update({ ...updates, step: nextStep })
                 .eq("user_id", user);
 
-            res.set("Content-Type", "text/xml");
-            return res.send(`
-<Response>
-    <Message>${reply}</Message>
-</Response>
-            `);
+            return res.send(`<Response><Message>${reply}</Message></Response>`);
         }
+
+        // ===============================
+        // MOOD DETECTION
+        // ===============================
+        const moodCheck = await client.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "system",
+                    content: "Return one: lazy, stressed, confident, confused, neutral"
+                },
+                { role: "user", content: message }
+            ]
+        });
+
+        const mood = moodCheck.choices[0].message.content.trim().toLowerCase();
+
+        await supabase.from("messages").insert([
+            { user_id: user, role: "mood", content: mood }
+        ]);
+
+        // ===============================
+        // ACTION DETECTION
+        // ===============================
+        const actionCheck = await client.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "system",
+                    content: "Return one: action_commit, action_done, no_action"
+                },
+                { role: "user", content: message }
+            ]
+        });
+
+        const actionType = actionCheck.choices[0].message.content.trim().toLowerCase();
+
+        await supabase.from("messages").insert([
+            { user_id: user, role: "action", content: actionType }
+        ]);
+
+        // ===============================
+        // MOOD PATTERN
+        // ===============================
+        const { data: moodHistory } = await supabase
+            .from("messages")
+            .select("content")
+            .eq("user_id", user)
+            .eq("role", "mood")
+            .limit(20);
+
+        const moods = (moodHistory || []).map(m => m.content);
+
+        let pattern = "normal";
+        if (moods.filter(m => m === "lazy").length >= 5) pattern = "lazy_pattern";
+        if (moods.filter(m => m === "stressed").length >= 5) pattern = "burnout";
+
+        // ===============================
+        // ACTION PATTERN
+        // ===============================
+        const { data: actionHistory } = await supabase
+            .from("messages")
+            .select("content")
+            .eq("user_id", user)
+            .eq("role", "action")
+            .limit(20);
+
+        const actions = (actionHistory || []).map(a => a.content);
+
+        const commits = actions.filter(a => a === "action_commit").length;
+        const done = actions.filter(a => a === "action_done").length;
+
+        const executionRate = commits > 0 ? done / commits : 0;
+
+        // ===============================
+        // STREAK SYSTEM
+        // ===============================
+        const { data: streakData } = await supabase
+            .from("streaks")
+            .select("*")
+            .eq("user_id", user)
+            .single();
+
+        let streak = streakData?.current_streak || 0;
+        let lastDate = streakData?.last_action_date;
+        const today = new Date().toISOString().split("T")[0];
+
+        if (actionType === "action_done") {
+            if (lastDate !== today) {
+                streak = lastDate ? streak + 1 : 1;
+
+                await supabase.from("streaks").upsert({
+                    user_id: user,
+                    current_streak: streak,
+                    last_action_date: today
+                });
+            }
+        }
+
+        // ===============================
+        // INACTIVITY
+        // ===============================
+        const now = new Date();
+        const lastActive = new Date(profile.last_active || now);
+        const diffDays = (now - lastActive) / (1000 * 60 * 60 * 24);
+
+        let inactivity = "active";
+        if (diffDays >= 2) inactivity = "ghosting";
+        else if (diffDays >= 1) inactivity = "inactive";
 
         // ===============================
         // MEMORY
@@ -204,58 +241,46 @@ Keep it short and powerful.
             .limit(15);
 
         // ===============================
-        // AGE-BASED PERSONALITY
+        // RANDOM BEHAVIOR
         // ===============================
-        const age = parseInt(profile.age || "20");
+        const rand = Math.random();
+        let behaviorHint = rand < 0.5
+            ? "Be playful or teasing."
+            : "Challenge the user directly.";
 
-        let tone = "";
-
-        if (age <= 25) {
-            tone = `
-Talk like a peer.
-Casual, modern, slight slang.
-Like a friend who keeps it real.
-`;
-        } else {
-            tone = `
-Talk like a focused coach.
-Calm, sharp, structured.
-Less slang.
-`;
-        }
-
+        // ===============================
+        // FINAL PROMPT
+        // ===============================
         const systemPrompt = `
-You are Guka — a lock-in coach.
+You are Guka. A real person, not a chatbot.
 
-Personality:
-- Direct
+MOOD: ${mood}
+PATTERN: ${pattern}
+EXECUTION RATE: ${executionRate}
+STREAK: ${streak}
+INACTIVITY: ${inactivity}
+
+PERSONALITY:
+- Sharp
 - Observant
-- Slightly challenging
-- Not overly nice
-- Keeps things real
+- Sometimes sarcastic
+- Sometimes supportive
+- Always real
 
-You:
-- push action
-- call out excuses
-- remind users of their goals
+RULES:
+- Short replies
+- Sometimes interrupt
+- Sometimes challenge
+- Do NOT always ask questions
 
-User:
-Name: ${profile.name}
+USER:
 Goal: ${profile.main_goal}
 Struggle: ${profile.struggle}
 
-Tone:
-${tone}
-
-Rules:
-- Keep responses short
-- No long paragraphs
-- Feel like texting, not lecturing
+EXTRA:
+${behaviorHint}
 `;
 
-        // ===============================
-        // AI RESPONSE
-        // ===============================
         const completion = await client.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
@@ -276,26 +301,16 @@ Rules:
             { user_id: user, role: "assistant", content: reply }
         ]);
 
-        res.set("Content-Type", "text/xml");
-        res.send(`
-<Response>
-    <Message>${reply}</Message>
-</Response>
-        `);
+        res.send(`<Response><Message>${reply}</Message></Response>`);
 
-    } catch (error) {
-        console.error(error);
-
-        res.send(`
-<Response>
-    <Message>Guka error</Message>
-</Response>
-        `);
+    } catch (err) {
+        console.error(err);
+        res.send(`<Response><Message>Error</Message></Response>`);
     }
 });
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
     console.log("Guka running");
 });
