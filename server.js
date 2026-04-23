@@ -7,9 +7,6 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// ===============================
-// CLIENTS
-// ===============================
 const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
@@ -19,11 +16,9 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
-// ===============================
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ===============================
 app.get("/", (req, res) => {
     res.send("Guka is running");
 });
@@ -47,68 +42,148 @@ app.post("/webhook", async (req, res) => {
             .eq("user_id", user)
             .single();
 
-        // CREATE IF NOT EXISTS
+        // CREATE USER
         if (!profile) {
             await supabase.from("user_profiles").insert([
                 { user_id: user, step: "name" }
             ]);
-
             profile = { step: "name" };
         }
 
         // ===============================
-        // ONBOARDING (STATE-BASED FIX)
+        // ONBOARDING (CONVERSATIONAL)
         // ===============================
         if (!profile.onboarding_complete) {
 
+            let nextStep = profile.step;
+            let updates = {};
+            let systemPrompt = "";
+
+            // ===============================
+            // STEP: NAME
+            // ===============================
             if (profile.step === "name") {
-                await supabase
-                    .from("user_profiles")
-                    .update({
-                        name: message,
-                        step: "age"
-                    })
-                    .eq("user_id", user);
 
-                reply = "How old are you?";
+                if (!profile.name) {
+                    reply = "hey 🙂 what's your name?";
+                    nextStep = "name";
+                } else {
+                    updates = { name: message };
+                    nextStep = "age";
+
+                    systemPrompt = `
+You are Guka.
+
+Reply like a human friend meeting someone new.
+React to their name naturally, slightly playful.
+
+Then smoothly ask for their age.
+Do NOT sound like a form.
+`;
+
+                }
             }
 
+            // ===============================
+            // STEP: AGE
+            // ===============================
             else if (profile.step === "age") {
-                await supabase
-                    .from("user_profiles")
-                    .update({
-                        age: message,
-                        step: "goal"
-                    })
-                    .eq("user_id", user);
 
-                reply = "What’s your main goal right now?";
+                updates = { age: message };
+                nextStep = "goal";
+
+                systemPrompt = `
+You are Guka.
+
+React to the user's age casually.
+Then naturally transition into asking about their goals.
+
+Style:
+- relaxed
+- slightly teasing
+- like a peer
+- not robotic
+
+Combine reaction + question naturally.
+`;
             }
 
+            // ===============================
+            // STEP: GOAL
+            // ===============================
             else if (profile.step === "goal") {
-                await supabase
-                    .from("user_profiles")
-                    .update({
-                        main_goal: message,
-                        step: "struggle"
-                    })
-                    .eq("user_id", user);
 
-                reply = "What’s actually holding you back?";
+                updates = { main_goal: message };
+                nextStep = "struggle";
+
+                systemPrompt = `
+You are Guka.
+
+User just told you their goal.
+
+Respond like:
+- you understand ambition
+- slight challenge tone
+- not impressed too easily
+
+Then ask:
+What's actually stopping them?
+
+Keep it conversational, not interview-like.
+`;
             }
 
+            // ===============================
+            // STEP: STRUGGLE
+            // ===============================
             else if (profile.step === "struggle") {
-                await supabase
-                    .from("user_profiles")
-                    .update({
-                        struggle: message,
-                        onboarding_complete: true,
-                        step: "done"
-                    })
-                    .eq("user_id", user);
 
-                reply = "Good. Now we lock in.";
+                updates = {
+                    struggle: message,
+                    onboarding_complete: true
+                };
+                nextStep = "done";
+
+                systemPrompt = `
+You are Guka.
+
+User just told you what's holding them back.
+
+Respond like:
+- you see through them
+- calm but sharp
+- slightly confrontational (not rude)
+
+Then end onboarding with something like:
+"alright... now we fix it"
+
+Keep it short and powerful.
+`;
             }
+
+            // ===============================
+            // AI RESPONSE (for onboarding steps except first)
+            // ===============================
+            if (systemPrompt) {
+                const completion = await client.chat.completions.create({
+                    model: "gpt-4o-mini",
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: message }
+                    ]
+                });
+
+                reply = completion.choices[0].message.content;
+            }
+
+            // SAVE DATA + STEP
+            await supabase
+                .from("user_profiles")
+                .update({
+                    ...updates,
+                    step: nextStep
+                })
+                .eq("user_id", user);
 
             res.set("Content-Type", "text/xml");
             return res.send(`
@@ -119,7 +194,7 @@ app.post("/webhook", async (req, res) => {
         }
 
         // ===============================
-        // FETCH MEMORY
+        // MEMORY
         // ===============================
         const { data: memory } = await supabase
             .from("messages")
@@ -129,7 +204,7 @@ app.post("/webhook", async (req, res) => {
             .limit(15);
 
         // ===============================
-        // PERSONALITY SYSTEM (FROM YOUR DOC)
+        // AGE-BASED PERSONALITY
         // ===============================
         const age = parseInt(profile.age || "20");
 
@@ -137,51 +212,45 @@ app.post("/webhook", async (req, res) => {
 
         if (age <= 25) {
             tone = `
-Speak like a peer (same age).
-Casual, direct, slight slang.
-Feels like a friend holding you accountable.
+Talk like a peer.
+Casual, modern, slight slang.
+Like a friend who keeps it real.
 `;
         } else {
             tone = `
-Speak like a disciplined coach.
-Calm, firm, slightly strict.
-No slang. More structured.
+Talk like a focused coach.
+Calm, sharp, structured.
+Less slang.
 `;
         }
 
         const systemPrompt = `
-You are Guka — The Lock-In Coach.
+You are Guka — a lock-in coach.
 
-Core behavior:
-- Direct and accountability-driven
-- You remind users what they said they would do
-- You check progress
-- You push when they slack
+Personality:
+- Direct
+- Observant
+- Slightly challenging
+- Not overly nice
+- Keeps things real
 
-Tone:
-- Calm, firm, solution-focused
-- Not emotional, not hype
-- Slightly strict but supportive
-
-Function:
-- Act like a productivity coach + accountability system
-- Reinforce habits
-- Keep users consistent
+You:
+- push action
+- call out excuses
+- remind users of their goals
 
 User:
 Name: ${profile.name}
-Age: ${profile.age}
 Goal: ${profile.main_goal}
 Struggle: ${profile.struggle}
 
-Extra tone rule:
+Tone:
 ${tone}
 
 Rules:
-- Keep replies short
+- Keep responses short
 - No long paragraphs
-- Ask questions when needed
-- Push action
+- Feel like texting, not lecturing
 `;
 
         // ===============================
@@ -203,14 +272,10 @@ Rules:
 
         // SAVE MEMORY
         await supabase.from("messages").insert([
-            {
-                user_id: user,
-                role: "assistant",
-                content: reply
-            }
+            { user_id: user, role: "user", content: message },
+            { user_id: user, role: "assistant", content: reply }
         ]);
 
-        // ===============================
         res.set("Content-Type", "text/xml");
         res.send(`
 <Response>
@@ -229,7 +294,6 @@ Rules:
     }
 });
 
-// ===============================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
