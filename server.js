@@ -8,7 +8,9 @@ const axios = require("axios");
 
 const app = express();
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -37,7 +39,7 @@ function twiml(messages) {
 ${arr
   .filter(Boolean)
   .slice(0, 5)
-  .map((m) => `  <Message>${escapeXml(m)}</Message>`)
+  .map((m) => `<Message>${escapeXml(m)}</Message>`)
   .join("\n")}
 </Response>`;
 }
@@ -46,18 +48,7 @@ function cleanMessage(message) {
   return (message || "").trim();
 }
 
-function looksLikeIntro(message) {
-  const msg = message.toLowerCase();
-  return (
-    msg.includes("what even is guka") ||
-    msg.includes("what is guka") ||
-    msg.includes("who is guka") ||
-    msg.includes("what even is tomo") ||
-    ["hi", "hey", "yo", "hello", "sup"].includes(msg)
-  );
-}
-
-async function classifyAndExtract(message, profile, memory) {
+async function analyzeAndExtract(message, profile, memory) {
   try {
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
@@ -68,8 +59,6 @@ async function classifyAndExtract(message, profile, memory) {
           content: `
 Return JSON only.
 
-Analyze the latest user message and extract only what the user clearly said.
-
 Schema:
 {
   "mood": "lazy | stressed | confident | confused | emotional | neutral",
@@ -78,26 +67,25 @@ Schema:
   "new_goal": "string or null",
   "new_reason": "string or null",
   "new_struggle": "string or null",
-  "new_routine": "string or null",
   "important_memory": "string or null"
 }
 
 Rules:
-- Do not invent details.
-- Do not use example conversation details.
-- Extract only from this user's current message.
+- Only extract what THIS user clearly said.
+- Never invent details.
+- Never use example stories.
 `
         },
         {
           role: "user",
           content: `
-Current saved profile:
+Profile:
 ${JSON.stringify(profile || {}, null, 2)}
 
 Recent memory:
 ${JSON.stringify((memory || []).slice(-6), null, 2)}
 
-Latest message:
+Latest user message:
 ${message}
 `
         }
@@ -106,7 +94,8 @@ ${message}
 
     return JSON.parse(completion.choices[0].message.content);
   } catch (error) {
-    console.error("Classification error:", error);
+    console.error("Analyze error:", error);
+
     return {
       mood: "neutral",
       action: "no_action",
@@ -114,7 +103,6 @@ ${message}
       new_goal: null,
       new_reason: null,
       new_struggle: null,
-      new_routine: null,
       important_memory: null
     };
   }
@@ -131,7 +119,9 @@ async function analyzeImageFromTwilio(mediaUrl, caption) {
     });
 
     const contentType = response.headers["content-type"] || "image/jpeg";
+
     const base64Image = Buffer.from(response.data).toString("base64");
+
     const dataUrl = `data:${contentType};base64,${base64Image}`;
 
     const completion = await client.chat.completions.create({
@@ -142,22 +132,22 @@ async function analyzeImageFromTwilio(mediaUrl, caption) {
           content: `
 You are Guka analyzing a WhatsApp image.
 
-If it is food:
-- Identify it.
-- Estimate calories as a rough range.
-- Clearly say it is an estimate.
-- Give one practical note.
+If food:
+- identify the food
+- estimate calories roughly
+- clearly say it is an estimate
+- give one short practical note
 
-If it is gym or workout related:
-- React like an accountability friend.
-- Comment only on what is visible.
-- Do not pretend to know exact details.
+If gym/workout:
+- react like an accountability friend
+- comment only on visible things
+- do not pretend to know details
 
 Style:
-- Short WhatsApp messages.
-- Real friend energy.
-- No em dashes.
-- No lecture.
+- short WhatsApp style
+- real human energy
+- no em dashes
+- no lecture
 `
         },
         {
@@ -165,11 +155,13 @@ Style:
           content: [
             {
               type: "text",
-              text: caption || "Analyze this image like Guka."
+              text: caption || "Analyze this image."
             },
             {
               type: "image_url",
-              image_url: { url: dataUrl }
+              image_url: {
+                url: dataUrl
+              }
             }
           ]
         }
@@ -179,7 +171,8 @@ Style:
     return completion.choices[0].message.content;
   } catch (error) {
     console.error("Image analysis error:", error);
-    return "I got the image, but I couldn’t read it properly. Send it again with a quick caption.";
+
+    return "I got the image but I couldn’t read it properly. Send it again with a quick caption.";
   }
 }
 
@@ -196,12 +189,15 @@ async function generateGukaMessages({
   inactivity,
   conversationMode
 }) {
-  const ageNum = parseInt(String(profile?.age || "").replace(/\D/g, ""), 10);
+  const ageNum = parseInt(
+    String(profile?.age || "").replace(/\D/g, ""),
+    10
+  );
 
   const peerTone =
     ageNum && ageNum <= 25
-      ? "Talk like a peer. Young adult energy. Natural slang is allowed."
-      : "Talk like a sharp, grounded friend. Less slang, still direct.";
+      ? "Talk like a peer. Young adult energy. Natural slang allowed."
+      : "Talk like a grounded sharp friend. Less slang but still casual.";
 
   const completion = await client.chat.completions.create({
     model: "gpt-4o-mini",
@@ -212,66 +208,91 @@ async function generateGukaMessages({
         content: `
 You are Guka.
 
-You are not a formal assistant.
-You are not a questionnaire.
-You are a lock-in friend who helps people understand themselves, build discipline, and stay accountable.
+You are NOT an assistant.
+You are NOT a therapist.
+You are NOT a productivity app.
+
+You are a real-feeling accountability friend.
 
 Return JSON only:
 {
   "messages": ["message 1", "message 2", "message 3"]
 }
 
-Use 1 to 5 short messages.
-Each message should feel like a separate WhatsApp text.
-Do not use em dashes.
-Do not use numbered lists unless the user specifically asks for a plan.
-Do not over-help too early.
-Do not end with vague lines like "we can map it out together."
-Do not say the same intro every time.
-Do not use the developer's personal life, routines, or example story.
-Only use THIS user's profile and messages.
+CRITICAL RULES:
+- Use 1 to 5 short WhatsApp-style messages.
+- Every message should feel like a separate text bubble.
+- NEVER use em dashes.
+- NEVER use numbered lists unless user specifically asks for a plan.
+- NEVER sound like customer support.
+- NEVER sound like a motivational coach.
+- NEVER say:
+  - "what's up"
+  - "how can I help"
+  - "what would you like to talk about"
+  - "anything specific"
+  - "let's break this down"
+  - "we can map it out together"
+  - "got something specific"
+- NEVER ask broad lazy questions.
+- ALWAYS ask emotionally or contextually specific questions.
+- ALWAYS guide the conversation.
+- NEVER hand the conversation responsibility back to the user completely.
+- NEVER over-help too early.
+- NEVER instantly create plans when user shares goals.
+- First understand WHY they care.
+- Then understand what has been stopping them.
+- THEN hold them accountable over time.
 
-Core rhythm:
-1. React first.
-2. Show you understand what they said.
-3. Go one layer deeper.
-4. Ask one strong natural question OR push one next action.
+VERY IMPORTANT:
+Do NOT use the developer's personal life or example chats.
+Every user has their own story.
 
-The most important rule:
-If the user shares goals, do not immediately make a plan.
-First ask WHY it matters.
-Then ask what has been stopping them.
-Then use those answers to build accountability.
+GOOD STYLE EXAMPLES:
 
-Good style:
-"Okay now we’re talking"
+"yeah okay so your life lowkey feels outta control rn"
 
-"That combo tells me you already know the problem"
+"not judging you btw"
 
-"But what’s making you wanna change this now?"
+"that combo usually means something deeper is going on"
 
-"Like what’s the real reason behind it"
+"so why does this actually matter to you tho"
 
-"Not judging you, just being real"
+"most people don’t randomly text something like this at 4am 💀"
 
-"That’s the pattern we need to break"
+"okay now we’re talking"
 
-Bad style:
-"Here are 3 steps"
-"Let’s break this down"
-"Got something specific you want to tackle?"
-"How can I assist you?"
-"Based on your goals..."
+"that’s the pattern right there"
+
+BAD STYLE EXAMPLES:
+
+"How can I assist you today?"
+
+"Let's create a plan."
+
+"What are your goals?"
+
+"Tell me more."
+
+"What's up?"
+
+Conversation rhythm:
+1. react
+2. interpret
+3. emotionally narrow
+4. ask ONE strong question or push ONE strong action
 
 Saved user profile:
 Name: ${profile?.name || "unknown"}
 Age: ${profile?.age || "unknown"}
 Main goal: ${profile?.main_goal || "unknown"}
-Reason or deeper motivation: ${profile?.mood || "unknown"}
+Reason/motivation: ${profile?.mood || "unknown"}
 Main struggle: ${profile?.struggle || "unknown"}
 
+Conversation mode:
+${conversationMode}
+
 Current state:
-Conversation mode: ${conversationMode}
 Mood: ${mood}
 Intent: ${intent}
 Action type: ${actionType}
@@ -284,15 +305,17 @@ Tone:
 ${peerTone}
 
 Safety:
-If the user seems overwhelmed, calm them down before pushing.
-If the user mentions alcohol, push moderation and discipline. Do not encourage drinking.
-If the user mentions immediate danger or self-harm, tell them to contact local emergency help or a trusted person.
+If overwhelmed, calm them before pushing.
+If discussing alcohol, push moderation and discipline.
+If immediate danger/self-harm appears, tell them to contact emergency help or a trusted person.
 `
       },
+
       ...(memory || []).map((m) => ({
         role: m.role,
         content: m.content
       })),
+
       {
         role: "user",
         content: message
@@ -301,10 +324,19 @@ If the user mentions immediate danger or self-harm, tell them to contact local e
   });
 
   try {
-    const parsed = JSON.parse(completion.choices[0].message.content);
-    return Array.isArray(parsed.messages) && parsed.messages.length
-      ? parsed.messages
-      : ["I hear you. Say more."];
+    const parsed = JSON.parse(
+      completion.choices[0].message.content
+    );
+
+    if (
+      parsed.messages &&
+      Array.isArray(parsed.messages) &&
+      parsed.messages.length
+    ) {
+      return parsed.messages;
+    }
+
+    return ["yeah say that again"];
   } catch {
     return [completion.choices[0].message.content];
   }
@@ -313,13 +345,23 @@ If the user mentions immediate danger or self-harm, tell them to contact local e
 app.post("/webhook", async (req, res) => {
   try {
     const user = req.body.From || "";
+
     const message = cleanMessage(req.body.Body);
+
     const numMedia = Number(req.body.NumMedia || 0);
-    const mediaUrl = numMedia > 0 ? req.body.MediaUrl0 : null;
-    const mediaType = numMedia > 0 ? req.body.MediaContentType0 || "" : "";
+
+    const mediaUrl =
+      numMedia > 0 ? req.body.MediaUrl0 : null;
+
+    const mediaType =
+      numMedia > 0
+        ? req.body.MediaContentType0 || ""
+        : "";
 
     if (!user) {
-      return res.send(twiml("Something’s off with your number. Try again."));
+      return res.send(
+        twiml("Something’s off. Try again.")
+      );
     }
 
     let { data: profile } = await supabase
@@ -332,8 +374,8 @@ app.post("/webhook", async (req, res) => {
       await supabase.from("user_profiles").insert([
         {
           user_id: user,
-          step: "intro",
           onboarding_complete: false,
+          step: "intro",
           last_active: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }
@@ -341,8 +383,8 @@ app.post("/webhook", async (req, res) => {
 
       profile = {
         user_id: user,
-        step: "intro",
-        onboarding_complete: false
+        onboarding_complete: false,
+        step: "intro"
       };
     }
 
@@ -361,142 +403,188 @@ app.post("/webhook", async (req, res) => {
       .select("*")
       .eq("user_id", user)
       .in("role", ["user", "assistant"])
-      .order("created_at", { ascending: true })
-      .limit(18);
+      .order("created_at", {
+        ascending: true
+      })
+      .limit(20);
 
-    // Image handling
-    if (mediaUrl && mediaType.startsWith("image/") && profile.onboarding_complete) {
-      const imageReply = await analyzeImageFromTwilio(mediaUrl, message);
+    // IMAGE HANDLING
+    if (
+      mediaUrl &&
+      mediaType.startsWith("image/") &&
+      profile.onboarding_complete
+    ) {
+      const imageReply =
+        await analyzeImageFromTwilio(
+          mediaUrl,
+          message
+        );
 
       await supabase.from("messages").insert([
-        { user_id: user, role: "user", content: message || "[image]" },
-        { user_id: user, role: "assistant", content: imageReply }
+        {
+          user_id: user,
+          role: "user",
+          content: message || "[image]"
+        },
+        {
+          user_id: user,
+          role: "assistant",
+          content: imageReply
+        }
       ]);
 
       return res.send(twiml(imageReply));
     }
 
-    // Natural intro and discovery flow
+    // NATURAL ONBOARDING
     if (!profile.onboarding_complete) {
-      let nextStep = profile.step || "intro";
       let updates = {};
+
+      let nextStep = profile.step || "intro";
+
       let replyMessages = [];
 
       if (nextStep === "intro") {
         nextStep = "name";
 
         replyMessages = [
-          "Yo 🤨",
-          "Another person tryna lock in huh?",
-          "I’ll explain in a sec but first, what’s your name?"
+          "yo 🤨",
+          "another person tryna lock in huh?",
+          "i’ll explain in a sec but first what’s your name"
         ];
       }
 
       else if (nextStep === "name") {
         updates.name = message;
+
         nextStep = "age";
 
-        const generated = await generateGukaMessages({
-          message,
-          profile: { ...profile, name: message },
-          memory,
-          mood: "neutral",
-          intent: "onboarding",
-          actionType: "no_action",
-          pattern: "new_user",
-          executionRate: 0,
-          streak: 0,
-          inactivity: "active",
-          conversationMode:
-            "User just gave their name. React naturally to the name, then ask age casually. Do not sound like a form."
-        });
-
-        replyMessages = generated;
+        replyMessages =
+          await generateGukaMessages({
+            message,
+            profile: {
+              ...profile,
+              name: message
+            },
+            memory,
+            mood: "neutral",
+            intent: "intro",
+            actionType: "no_action",
+            pattern: "new_user",
+            executionRate: 0,
+            streak: 0,
+            inactivity: "active",
+            conversationMode:
+              "User just gave their name. React naturally to it, then casually ask age."
+          });
       }
 
       else if (nextStep === "age") {
         updates.age = message;
+
         nextStep = "goal";
 
-        replyMessages = await generateGukaMessages({
-          message,
-          profile: { ...profile, age: message },
-          memory,
-          mood: "neutral",
-          intent: "onboarding",
-          actionType: "no_action",
-          pattern: "new_user",
-          executionRate: 0,
-          streak: 0,
-          inactivity: "active",
-          conversationMode:
-            "User just gave age. React briefly, then ask what they are trying to fix, build, or improve. Make it broad and natural."
-        });
+        replyMessages =
+          await generateGukaMessages({
+            message,
+            profile: {
+              ...profile,
+              age: message
+            },
+            memory,
+            mood: "neutral",
+            intent: "intro",
+            actionType: "no_action",
+            pattern: "new_user",
+            executionRate: 0,
+            streak: 0,
+            inactivity: "active",
+            conversationMode:
+              "User just gave age. React briefly then naturally ask what in their life feels off or what they’re trying to change."
+          });
       }
 
       else if (nextStep === "goal") {
         updates.main_goal = message;
+
         nextStep = "reason";
 
-        replyMessages = await generateGukaMessages({
-          message,
-          profile: { ...profile, main_goal: message },
-          memory,
-          mood: "neutral",
-          intent: "goal_discovery",
-          actionType: "action_commit",
-          pattern: "new_user_goal",
-          executionRate: 0,
-          streak: 0,
-          inactivity: "active",
-          conversationMode:
-            "User shared goals. Do NOT create a plan yet. React to the goals, summarize the pattern, then ask what is making them want to change right now or what the real reason is."
-        });
+        replyMessages =
+          await generateGukaMessages({
+            message,
+            profile: {
+              ...profile,
+              main_goal: message
+            },
+            memory,
+            mood: "neutral",
+            intent: "goal",
+            actionType: "action_commit",
+            pattern: "goal_discovery",
+            executionRate: 0,
+            streak: 0,
+            inactivity: "active",
+            conversationMode:
+              "User shared goals. Do NOT make a plan. React emotionally, interpret the pattern, then ask WHY this matters to them right now."
+          });
       }
 
       else if (nextStep === "reason") {
         updates.mood = message;
+
         nextStep = "struggle";
 
-        replyMessages = await generateGukaMessages({
-          message,
-          profile: { ...profile, mood: message },
-          memory,
-          mood: "emotional",
-          intent: "deeper_reason",
-          actionType: "no_action",
-          pattern: "motivation_discovery",
-          executionRate: 0,
-          streak: 0,
-          inactivity: "active",
-          conversationMode:
-            "User explained why their goals matter. Respect their honesty, go one layer deeper, then ask what has actually been stopping them. Do not give a plan yet."
-        });
+        replyMessages =
+          await generateGukaMessages({
+            message,
+            profile: {
+              ...profile,
+              mood: message
+            },
+            memory,
+            mood: "emotional",
+            intent: "deeper_reason",
+            actionType: "no_action",
+            pattern: "motivation_discovery",
+            executionRate: 0,
+            streak: 0,
+            inactivity: "active",
+            conversationMode:
+              "User explained deeper motivation. Respect the honesty. Go one emotional layer deeper, then ask what has been stopping them."
+          });
       }
 
       else if (nextStep === "struggle") {
         updates.struggle = message;
+
         updates.onboarding_complete = true;
+
         nextStep = "active";
 
-        replyMessages = await generateGukaMessages({
-          message,
-          profile: { ...profile, struggle: message },
-          memory,
-          mood: "emotional",
-          intent: "struggle_discovery",
-          actionType: "no_action",
-          pattern: "core_pattern_found",
-          executionRate: 0,
-          streak: 0,
-          inactivity: "active",
-          conversationMode:
-            "User revealed what has been stopping them. React deeply, identify the pattern, then transition into locking in. Ask what first commitment they want to make today."
-        });
+        replyMessages =
+          await generateGukaMessages({
+            message,
+            profile: {
+              ...profile,
+              struggle: message
+            },
+            memory,
+            mood: "emotional",
+            intent: "struggle",
+            actionType: "no_action",
+            pattern: "core_pattern_found",
+            executionRate: 0,
+            streak: 0,
+            inactivity: "active",
+            conversationMode:
+              "User revealed their main struggle. Identify the pattern. Make them feel understood. Transition naturally into accountability and ask for one real commitment today."
+          });
       }
 
       updates.step = nextStep;
-      updates.updated_at = new Date().toISOString();
+
+      updates.updated_at =
+        new Date().toISOString();
 
       await supabase
         .from("user_profiles")
@@ -504,25 +592,38 @@ app.post("/webhook", async (req, res) => {
         .eq("user_id", user);
 
       await supabase.from("messages").insert([
-        { user_id: user, role: "user", content: message || "[start]" },
-        { user_id: user, role: "assistant", content: replyMessages.join("\n\n") }
+        {
+          user_id: user,
+          role: "user",
+          content: message || "[start]"
+        },
+        {
+          user_id: user,
+          role: "assistant",
+          content: replyMessages.join("\n\n")
+        }
       ]);
 
       return res.send(twiml(replyMessages));
     }
 
-    // Refresh profile
-    const { data: refreshedProfile } = await supabase
-      .from("user_profiles")
-      .select("*")
-      .eq("user_id", user)
-      .single();
+    // REFRESH PROFILE
+    const { data: refreshedProfile } =
+      await supabase
+        .from("user_profiles")
+        .select("*")
+        .eq("user_id", user)
+        .single();
 
     profile = refreshedProfile || profile;
 
-    // Commands
-    if (message.toLowerCase().startsWith("goal:")) {
-      const goalText = message.replace(/goal:/i, "").trim();
+    // GOAL COMMAND
+    if (
+      message.toLowerCase().startsWith("goal:")
+    ) {
+      const goalText = message
+        .replace(/goal:/i, "")
+        .trim();
 
       await supabase.from("goals").insert([
         {
@@ -532,10 +633,18 @@ app.post("/webhook", async (req, res) => {
         }
       ]);
 
-      return res.send(twiml(["Locked.", `Goal saved: ${goalText}`]));
+      return res.send(
+        twiml([
+          "locked",
+          `goal saved: ${goalText}`
+        ])
+      );
     }
 
-    if (message.toLowerCase().includes("my goals")) {
+    // SHOW GOALS
+    if (
+      message.toLowerCase().includes("my goals")
+    ) {
       const { data: goals } = await supabase
         .from("goals")
         .select("*")
@@ -544,32 +653,86 @@ app.post("/webhook", async (req, res) => {
 
       if (!goals || goals.length === 0) {
         return res.send(
-          twiml("You don’t have saved goals yet. Send one like:\n\ngoal: gym 5x a week")
+          twiml(
+            "you don’t have saved goals yet"
+          )
         );
       }
 
-      const list = goals.map((g, i) => `${i + 1}. ${g.goal}`).join("\n");
+      const list = goals
+        .map((g, i) => `${i + 1}. ${g.goal}`)
+        .join("\n");
 
-      return res.send(twiml(`Here’s what we’re tracking:\n\n${list}`));
+      return res.send(
+        twiml([
+          "here’s what we’re tracking",
+          list
+        ])
+      );
     }
 
-    const analysis = await classifyAndExtract(message, profile, memory);
-    const mood = analysis.mood || "neutral";
-    const actionType = analysis.action || "no_action";
-    const intent = analysis.intent || "normal";
+    // ANALYSIS
+    const analysis =
+      await analyzeAndExtract(
+        message,
+        profile,
+        memory
+      );
+
+    const mood =
+      analysis.mood || "neutral";
+
+    const actionType =
+      analysis.action || "no_action";
+
+    const intent =
+      analysis.intent || "normal";
 
     await supabase.from("messages").insert([
-      { user_id: user, role: "mood", content: mood },
-      { user_id: user, role: "action", content: actionType }
+      {
+        user_id: user,
+        role: "mood",
+        content: mood
+      },
+      {
+        user_id: user,
+        role: "action",
+        content: actionType
+      }
     ]);
 
-    // Silently update profile if the user revealed important info
+    // SILENT MEMORY UPDATES
     const profileUpdates = {};
-    if (analysis.new_goal && !profile.main_goal) profileUpdates.main_goal = analysis.new_goal;
-    if (analysis.new_reason && !profile.mood) profileUpdates.mood = analysis.new_reason;
-    if (analysis.new_struggle && !profile.struggle) profileUpdates.struggle = analysis.new_struggle;
-    if (Object.keys(profileUpdates).length > 0) {
-      profileUpdates.updated_at = new Date().toISOString();
+
+    if (
+      analysis.new_goal &&
+      !profile.main_goal
+    ) {
+      profileUpdates.main_goal =
+        analysis.new_goal;
+    }
+
+    if (
+      analysis.new_reason &&
+      !profile.mood
+    ) {
+      profileUpdates.mood =
+        analysis.new_reason;
+    }
+
+    if (
+      analysis.new_struggle &&
+      !profile.struggle
+    ) {
+      profileUpdates.struggle =
+        analysis.new_struggle;
+    }
+
+    if (
+      Object.keys(profileUpdates).length > 0
+    ) {
+      profileUpdates.updated_at =
+        new Date().toISOString();
 
       await supabase
         .from("user_profiles")
@@ -592,64 +755,122 @@ app.post("/webhook", async (req, res) => {
         {
           user_id: user,
           role: "memory",
-          content: analysis.important_memory
+          content:
+            analysis.important_memory
         }
       ]);
     }
 
-    // Mood pattern
-    const { data: moodHistory } = await supabase
-      .from("messages")
-      .select("content")
-      .eq("user_id", user)
-      .eq("role", "mood")
-      .order("created_at", { ascending: false })
-      .limit(20);
+    // PATTERN DETECTION
+    const { data: moodHistory } =
+      await supabase
+        .from("messages")
+        .select("content")
+        .eq("user_id", user)
+        .eq("role", "mood")
+        .order("created_at", {
+          ascending: false
+        })
+        .limit(20);
 
-    const moods = (moodHistory || []).map((m) => m.content);
-    const lazyCount = moods.filter((m) => m === "lazy").length;
-    const stressedCount = moods.filter((m) => m === "stressed").length;
-    const emotionalCount = moods.filter((m) => m === "emotional").length;
+    const moods = (moodHistory || []).map(
+      (m) => m.content
+    );
+
+    const lazyCount = moods.filter(
+      (m) => m === "lazy"
+    ).length;
+
+    const stressedCount = moods.filter(
+      (m) => m === "stressed"
+    ).length;
+
+    const emotionalCount = moods.filter(
+      (m) => m === "emotional"
+    ).length;
 
     let pattern = "normal";
-    if (lazyCount >= 5) pattern = "repeated_slacking";
-    if (stressedCount >= 5) pattern = "burnout_risk";
-    if (emotionalCount >= 4) pattern = "emotionally_distracted";
 
-    // Action pattern
-    const { data: actionHistory } = await supabase
-      .from("messages")
-      .select("content")
-      .eq("user_id", user)
-      .eq("role", "action")
-      .order("created_at", { ascending: false })
-      .limit(20);
+    if (lazyCount >= 5) {
+      pattern = "repeated_slacking";
+    }
 
-    const actions = (actionHistory || []).map((a) => a.content);
-    const commits = actions.filter((a) => a === "action_commit").length;
-    const done = actions.filter((a) => a === "action_done").length;
-    const executionRate = commits > 0 ? Number((done / commits).toFixed(2)) : 0;
+    if (stressedCount >= 5) {
+      pattern = "burnout_risk";
+    }
 
-    // Streak
-    const { data: streakData } = await supabase
-      .from("streaks")
-      .select("*")
-      .eq("user_id", user)
-      .single();
+    if (emotionalCount >= 4) {
+      pattern = "emotionally_distracted";
+    }
 
-    let streak = streakData?.current_streak || 0;
-    let lastDate = streakData?.last_action_date || null;
-    const today = new Date().toISOString().split("T")[0];
+    // ACTION HISTORY
+    const { data: actionHistory } =
+      await supabase
+        .from("messages")
+        .select("content")
+        .eq("user_id", user)
+        .eq("role", "action")
+        .order("created_at", {
+          ascending: false
+        })
+        .limit(20);
+
+    const actions = (
+      actionHistory || []
+    ).map((a) => a.content);
+
+    const commits = actions.filter(
+      (a) => a === "action_commit"
+    ).length;
+
+    const done = actions.filter(
+      (a) => a === "action_done"
+    ).length;
+
+    const executionRate =
+      commits > 0
+        ? Number((done / commits).toFixed(2))
+        : 0;
+
+    // STREAK
+    const { data: streakData } =
+      await supabase
+        .from("streaks")
+        .select("*")
+        .eq("user_id", user)
+        .single();
+
+    let streak =
+      streakData?.current_streak || 0;
+
+    let lastDate =
+      streakData?.last_action_date ||
+      null;
+
+    const today = new Date()
+      .toISOString()
+      .split("T")[0];
 
     if (actionType === "action_done") {
       if (!lastDate) {
         streak = 1;
-      } else if (lastDate !== today) {
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yDate = yesterday.toISOString().split("T")[0];
+      }
 
-        streak = lastDate === yDate ? streak + 1 : 1;
+      else if (lastDate !== today) {
+        const yesterday = new Date();
+
+        yesterday.setDate(
+          yesterday.getDate() - 1
+        );
+
+        const yDate = yesterday
+          .toISOString()
+          .split("T")[0];
+
+        streak =
+          lastDate === yDate
+            ? streak + 1
+            : 1;
       }
 
       await supabase.from("streaks").upsert({
@@ -659,52 +880,95 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // Inactivity
+    // INACTIVITY
     const now = new Date();
-    const lastActive = new Date(previousLastActive || now);
-    const diffDays = (now.getTime() - lastActive.getTime()) / (1000 * 60 * 60 * 24);
+
+    const lastActive = new Date(
+      previousLastActive || now
+    );
+
+    const diffDays =
+      (now.getTime() -
+        lastActive.getTime()) /
+      (1000 * 60 * 60 * 24);
 
     let inactivity = "active";
-    if (diffDays >= 2) inactivity = "ghosted";
-    else if (diffDays >= 1) inactivity = "quiet";
 
-    const { data: latestMemory } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("user_id", user)
-      .in("role", ["user", "assistant"])
-      .order("created_at", { ascending: true })
-      .limit(18);
+    if (diffDays >= 2) {
+      inactivity = "ghosted";
+    }
 
-    const replyMessages = await generateGukaMessages({
-      message,
-      profile,
-      memory: latestMemory || memory,
-      mood,
-      intent,
-      actionType,
-      pattern,
-      executionRate,
-      streak,
-      inactivity,
-      conversationMode:
-        "Active conversation. Respond naturally based on the user's actual message. Do not use lists unless requested. If they shared emotion, probe deeper. If they made a commitment, hold them to it. If they are vague, ask for the real plan."
-    });
+    else if (diffDays >= 1) {
+      inactivity = "quiet";
+    }
+
+    // REFRESH MEMORY
+    const { data: latestMemory } =
+      await supabase
+        .from("messages")
+        .select("*")
+        .eq("user_id", user)
+        .in("role", ["user", "assistant"])
+        .order("created_at", {
+          ascending: true
+        })
+        .limit(20);
+
+    // MAIN RESPONSE
+    const replyMessages =
+      await generateGukaMessages({
+        message,
+        profile,
+        memory: latestMemory || memory,
+        mood,
+        intent,
+        actionType,
+        pattern,
+        executionRate,
+        streak,
+        inactivity,
+        conversationMode:
+          "Active conversation. Respond naturally to THIS user's actual message. Avoid vague questions. Lead the emotional direction of the conversation confidently."
+      });
 
     await supabase.from("messages").insert([
-      { user_id: user, role: "user", content: message },
-      { user_id: user, role: "assistant", content: replyMessages.join("\n\n") }
+      {
+        user_id: user,
+        role: "user",
+        content: message
+      },
+      {
+        user_id: user,
+        role: "assistant",
+        content:
+          replyMessages.join("\n\n")
+      }
     ]);
 
-    return res.send(twiml(replyMessages));
-  } catch (error) {
-    console.error("Webhook error:", error);
-    return res.send(twiml("Guka is bugging right now. Try again in a sec."));
+    return res.send(
+      twiml(replyMessages)
+    );
+  }
+
+  catch (error) {
+    console.error(
+      "Webhook error:",
+      error
+    );
+
+    return res.send(
+      twiml(
+        "guka bugging rn 💀 try again in a sec"
+      )
+    );
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT =
+  process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Guka running on port " + PORT);
+  console.log(
+    "Guka running on port " + PORT
+  );
 });
