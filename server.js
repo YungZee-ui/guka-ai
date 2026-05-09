@@ -29,29 +29,35 @@ function escapeXml(text = "") {
     .replace(/>/g, "&gt;");
 }
 
-function twiml(message) {
-  return `<Response><Message>${escapeXml(message)}</Message></Response>`;
+function twiml(messages) {
+  const arr = Array.isArray(messages) ? messages : [messages];
+
+  return `
+<Response>
+${arr
+  .filter(Boolean)
+  .slice(0, 5)
+  .map((m) => `  <Message>${escapeXml(m)}</Message>`)
+  .join("\n")}
+</Response>`;
 }
 
 function cleanMessage(message) {
   return (message || "").trim();
 }
 
-function isIntroQuestion(message) {
+function looksLikeIntro(message) {
   const msg = message.toLowerCase();
   return (
     msg.includes("what even is guka") ||
     msg.includes("what is guka") ||
     msg.includes("who is guka") ||
     msg.includes("what even is tomo") ||
-    msg === "hi" ||
-    msg === "hey" ||
-    msg === "yo" ||
-    msg === "hello"
+    ["hi", "hey", "yo", "hello", "sup"].includes(msg)
   );
 }
 
-async function classifyMessage(message) {
+async function classifyAndExtract(message, profile, memory) {
   try {
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
@@ -60,24 +66,56 @@ async function classifyMessage(message) {
         {
           role: "system",
           content: `
-Return JSON only:
+Return JSON only.
+
+Analyze the latest user message and extract only what the user clearly said.
+
+Schema:
 {
   "mood": "lazy | stressed | confident | confused | emotional | neutral",
   "action": "action_commit | action_done | no_action",
-  "intent": "food | workout | relationship | school | money | schedule | reminder | accountability | normal"
+  "intent": "food | workout | relationship | school | money | schedule | reminder | accountability | normal",
+  "new_goal": "string or null",
+  "new_reason": "string or null",
+  "new_struggle": "string or null",
+  "new_routine": "string or null",
+  "important_memory": "string or null"
 }
+
+Rules:
+- Do not invent details.
+- Do not use example conversation details.
+- Extract only from this user's current message.
 `
         },
-        { role: "user", content: message }
+        {
+          role: "user",
+          content: `
+Current saved profile:
+${JSON.stringify(profile || {}, null, 2)}
+
+Recent memory:
+${JSON.stringify((memory || []).slice(-6), null, 2)}
+
+Latest message:
+${message}
+`
+        }
       ]
     });
 
     return JSON.parse(completion.choices[0].message.content);
-  } catch {
+  } catch (error) {
+    console.error("Classification error:", error);
     return {
       mood: "neutral",
       action: "no_action",
-      intent: "normal"
+      intent: "normal",
+      new_goal: null,
+      new_reason: null,
+      new_struggle: null,
+      new_routine: null,
+      important_memory: null
     };
   }
 }
@@ -102,24 +140,24 @@ async function analyzeImageFromTwilio(mediaUrl, caption) {
         {
           role: "system",
           content: `
-You are Guka analyzing an image sent on WhatsApp.
+You are Guka analyzing a WhatsApp image.
 
 If it is food:
-- Identify the food.
+- Identify it.
 - Estimate calories as a rough range.
-- Say it is an estimate, not exact.
-- Give one practical comment.
+- Clearly say it is an estimate.
+- Give one practical note.
 
-If it is gym/workout:
-- React like an accountability coach.
-- Mention effort/setup if visible.
-- Do not pretend to know details you cannot see.
+If it is gym or workout related:
+- React like an accountability friend.
+- Comment only on what is visible.
+- Do not pretend to know exact details.
 
-Tone:
+Style:
+- Short WhatsApp messages.
 - Real friend energy.
-- Short WhatsApp-style lines.
 - No em dashes.
-- No robotic nutrition lecture.
+- No lecture.
 `
         },
         {
@@ -142,6 +180,133 @@ Tone:
   } catch (error) {
     console.error("Image analysis error:", error);
     return "I got the image, but I couldn’t read it properly. Send it again with a quick caption.";
+  }
+}
+
+async function generateGukaMessages({
+  message,
+  profile,
+  memory,
+  mood,
+  intent,
+  actionType,
+  pattern,
+  executionRate,
+  streak,
+  inactivity,
+  conversationMode
+}) {
+  const ageNum = parseInt(String(profile?.age || "").replace(/\D/g, ""), 10);
+
+  const peerTone =
+    ageNum && ageNum <= 25
+      ? "Talk like a peer. Young adult energy. Natural slang is allowed."
+      : "Talk like a sharp, grounded friend. Less slang, still direct.";
+
+  const completion = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `
+You are Guka.
+
+You are not a formal assistant.
+You are not a questionnaire.
+You are a lock-in friend who helps people understand themselves, build discipline, and stay accountable.
+
+Return JSON only:
+{
+  "messages": ["message 1", "message 2", "message 3"]
+}
+
+Use 1 to 5 short messages.
+Each message should feel like a separate WhatsApp text.
+Do not use em dashes.
+Do not use numbered lists unless the user specifically asks for a plan.
+Do not over-help too early.
+Do not end with vague lines like "we can map it out together."
+Do not say the same intro every time.
+Do not use the developer's personal life, routines, or example story.
+Only use THIS user's profile and messages.
+
+Core rhythm:
+1. React first.
+2. Show you understand what they said.
+3. Go one layer deeper.
+4. Ask one strong natural question OR push one next action.
+
+The most important rule:
+If the user shares goals, do not immediately make a plan.
+First ask WHY it matters.
+Then ask what has been stopping them.
+Then use those answers to build accountability.
+
+Good style:
+"Okay now we’re talking"
+
+"That combo tells me you already know the problem"
+
+"But what’s making you wanna change this now?"
+
+"Like what’s the real reason behind it"
+
+"Not judging you, just being real"
+
+"That’s the pattern we need to break"
+
+Bad style:
+"Here are 3 steps"
+"Let’s break this down"
+"Got something specific you want to tackle?"
+"How can I assist you?"
+"Based on your goals..."
+
+Saved user profile:
+Name: ${profile?.name || "unknown"}
+Age: ${profile?.age || "unknown"}
+Main goal: ${profile?.main_goal || "unknown"}
+Reason or deeper motivation: ${profile?.mood || "unknown"}
+Main struggle: ${profile?.struggle || "unknown"}
+
+Current state:
+Conversation mode: ${conversationMode}
+Mood: ${mood}
+Intent: ${intent}
+Action type: ${actionType}
+Pattern: ${pattern}
+Execution rate: ${executionRate}
+Streak: ${streak}
+Inactivity: ${inactivity}
+
+Tone:
+${peerTone}
+
+Safety:
+If the user seems overwhelmed, calm them down before pushing.
+If the user mentions alcohol, push moderation and discipline. Do not encourage drinking.
+If the user mentions immediate danger or self-harm, tell them to contact local emergency help or a trusted person.
+`
+      },
+      ...(memory || []).map((m) => ({
+        role: m.role,
+        content: m.content
+      })),
+      {
+        role: "user",
+        content: message
+      }
+    ]
+  });
+
+  try {
+    const parsed = JSON.parse(completion.choices[0].message.content);
+    return Array.isArray(parsed.messages) && parsed.messages.length
+      ? parsed.messages
+      : ["I hear you. Say more."];
+  } catch {
+    return [completion.choices[0].message.content];
   }
 }
 
@@ -191,6 +356,15 @@ app.post("/webhook", async (req, res) => {
       })
       .eq("user_id", user);
 
+    const { data: memory } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("user_id", user)
+      .in("role", ["user", "assistant"])
+      .order("created_at", { ascending: true })
+      .limit(18);
+
+    // Image handling
     if (mediaUrl && mediaType.startsWith("image/") && profile.onboarding_complete) {
       const imageReply = await analyzeImageFromTwilio(mediaUrl, message);
 
@@ -202,80 +376,123 @@ app.post("/webhook", async (req, res) => {
       return res.send(twiml(imageReply));
     }
 
-    // =========================
-    // GENERALIZED ONBOARDING
-    // =========================
+    // Natural intro and discovery flow
     if (!profile.onboarding_complete) {
-      let reply = "";
-      let updates = {};
       let nextStep = profile.step || "intro";
+      let updates = {};
+      let replyMessages = [];
 
       if (nextStep === "intro") {
         nextStep = "name";
 
-        reply = `Yo 🤨
-
-Another person tryna lock in huh?
-
-I’ll explain in a sec, but first what’s your name?`;
+        replyMessages = [
+          "Yo 🤨",
+          "Another person tryna lock in huh?",
+          "I’ll explain in a sec but first, what’s your name?"
+        ];
       }
 
       else if (nextStep === "name") {
         updates.name = message;
         nextStep = "age";
 
-        reply = `${message}?? okay, I see you
+        const generated = await generateGukaMessages({
+          message,
+          profile: { ...profile, name: message },
+          memory,
+          mood: "neutral",
+          intent: "onboarding",
+          actionType: "no_action",
+          pattern: "new_user",
+          executionRate: 0,
+          streak: 0,
+          inactivity: "active",
+          conversationMode:
+            "User just gave their name. React naturally to the name, then ask age casually. Do not sound like a form."
+        });
 
-Wait also, how old are you?
-
-Not being weird, relax`;
+        replyMessages = generated;
       }
 
       else if (nextStep === "age") {
         updates.age = message;
         nextStep = "goal";
 
-        reply = `Bet
-
-So tell me what you’re actually tryna fix, build, or improve right now
-
-Could be school, money, fitness, discipline, relationships, whatever`;
+        replyMessages = await generateGukaMessages({
+          message,
+          profile: { ...profile, age: message },
+          memory,
+          mood: "neutral",
+          intent: "onboarding",
+          actionType: "no_action",
+          pattern: "new_user",
+          executionRate: 0,
+          streak: 0,
+          inactivity: "active",
+          conversationMode:
+            "User just gave age. React briefly, then ask what they are trying to fix, build, or improve. Make it broad and natural."
+        });
       }
 
       else if (nextStep === "goal") {
         updates.main_goal = message;
         nextStep = "reason";
 
-        reply = `Okay now we’re getting somewhere
-
-But why does that actually matter to you?
-
-Like what’s the real reason behind it`;
+        replyMessages = await generateGukaMessages({
+          message,
+          profile: { ...profile, main_goal: message },
+          memory,
+          mood: "neutral",
+          intent: "goal_discovery",
+          actionType: "action_commit",
+          pattern: "new_user_goal",
+          executionRate: 0,
+          streak: 0,
+          inactivity: "active",
+          conversationMode:
+            "User shared goals. Do NOT create a plan yet. React to the goals, summarize the pattern, then ask what is making them want to change right now or what the real reason is."
+        });
       }
 
       else if (nextStep === "reason") {
         updates.mood = message;
         nextStep = "struggle";
 
-        reply = `That makes sense
-
-But be real with me now
-
-What’s been stopping you from already being that version of yourself?`;
+        replyMessages = await generateGukaMessages({
+          message,
+          profile: { ...profile, mood: message },
+          memory,
+          mood: "emotional",
+          intent: "deeper_reason",
+          actionType: "no_action",
+          pattern: "motivation_discovery",
+          executionRate: 0,
+          streak: 0,
+          inactivity: "active",
+          conversationMode:
+            "User explained why their goals matter. Respect their honesty, go one layer deeper, then ask what has actually been stopping them. Do not give a plan yet."
+        });
       }
 
       else if (nextStep === "struggle") {
         updates.struggle = message;
         updates.onboarding_complete = true;
-        nextStep = "done";
+        nextStep = "active";
 
-        reply = `Yeah… that’s the part right there
-
-Not judging you, just being real
-
-That’s the pattern we need to break
-
-Now we lock in`;
+        replyMessages = await generateGukaMessages({
+          message,
+          profile: { ...profile, struggle: message },
+          memory,
+          mood: "emotional",
+          intent: "struggle_discovery",
+          actionType: "no_action",
+          pattern: "core_pattern_found",
+          executionRate: 0,
+          streak: 0,
+          inactivity: "active",
+          conversationMode:
+            "User revealed what has been stopping them. React deeply, identify the pattern, then transition into locking in. Ask what first commitment they want to make today."
+        });
       }
 
       updates.step = nextStep;
@@ -286,7 +503,12 @@ Now we lock in`;
         .update(updates)
         .eq("user_id", user);
 
-      return res.send(twiml(reply));
+      await supabase.from("messages").insert([
+        { user_id: user, role: "user", content: message || "[start]" },
+        { user_id: user, role: "assistant", content: replyMessages.join("\n\n") }
+      ]);
+
+      return res.send(twiml(replyMessages));
     }
 
     // Refresh profile
@@ -298,9 +520,7 @@ Now we lock in`;
 
     profile = refreshedProfile || profile;
 
-    // =========================
-    // COMMANDS
-    // =========================
+    // Commands
     if (message.toLowerCase().startsWith("goal:")) {
       const goalText = message.replace(/goal:/i, "").trim();
 
@@ -312,9 +532,7 @@ Now we lock in`;
         }
       ]);
 
-      return res.send(twiml(`Locked.
-
-Goal saved: ${goalText}`));
+      return res.send(twiml(["Locked.", `Goal saved: ${goalText}`]));
     }
 
     if (message.toLowerCase().includes("my goals")) {
@@ -325,7 +543,9 @@ Goal saved: ${goalText}`));
         .eq("status", "active");
 
       if (!goals || goals.length === 0) {
-        return res.send(twiml("You don’t have saved goals yet. Send one like:\n\ngoal: gym 5x a week"));
+        return res.send(
+          twiml("You don’t have saved goals yet. Send one like:\n\ngoal: gym 5x a week")
+        );
       }
 
       const list = goals.map((g, i) => `${i + 1}. ${g.goal}`).join("\n");
@@ -333,10 +553,7 @@ Goal saved: ${goalText}`));
       return res.send(twiml(`Here’s what we’re tracking:\n\n${list}`));
     }
 
-    // =========================
-    // CLASSIFY MESSAGE
-    // =========================
-    const analysis = await classifyMessage(message);
+    const analysis = await classifyAndExtract(message, profile, memory);
     const mood = analysis.mood || "neutral";
     const actionType = analysis.action || "no_action";
     const intent = analysis.intent || "normal";
@@ -346,9 +563,41 @@ Goal saved: ${goalText}`));
       { user_id: user, role: "action", content: actionType }
     ]);
 
-    // =========================
-    // HISTORY
-    // =========================
+    // Silently update profile if the user revealed important info
+    const profileUpdates = {};
+    if (analysis.new_goal && !profile.main_goal) profileUpdates.main_goal = analysis.new_goal;
+    if (analysis.new_reason && !profile.mood) profileUpdates.mood = analysis.new_reason;
+    if (analysis.new_struggle && !profile.struggle) profileUpdates.struggle = analysis.new_struggle;
+    if (Object.keys(profileUpdates).length > 0) {
+      profileUpdates.updated_at = new Date().toISOString();
+
+      await supabase
+        .from("user_profiles")
+        .update(profileUpdates)
+        .eq("user_id", user);
+    }
+
+    if (analysis.new_goal) {
+      await supabase.from("goals").insert([
+        {
+          user_id: user,
+          goal: analysis.new_goal,
+          status: "active"
+        }
+      ]);
+    }
+
+    if (analysis.important_memory) {
+      await supabase.from("messages").insert([
+        {
+          user_id: user,
+          role: "memory",
+          content: analysis.important_memory
+        }
+      ]);
+    }
+
+    // Mood pattern
     const { data: moodHistory } = await supabase
       .from("messages")
       .select("content")
@@ -367,6 +616,7 @@ Goal saved: ${goalText}`));
     if (stressedCount >= 5) pattern = "burnout_risk";
     if (emotionalCount >= 4) pattern = "emotionally_distracted";
 
+    // Action pattern
     const { data: actionHistory } = await supabase
       .from("messages")
       .select("content")
@@ -380,9 +630,7 @@ Goal saved: ${goalText}`));
     const done = actions.filter((a) => a === "action_done").length;
     const executionRate = commits > 0 ? Number((done / commits).toFixed(2)) : 0;
 
-    // =========================
-    // STREAK
-    // =========================
+    // Streak
     const { data: streakData } = await supabase
       .from("streaks")
       .select("*")
@@ -411,9 +659,7 @@ Goal saved: ${goalText}`));
       });
     }
 
-    // =========================
-    // INACTIVITY
-    // =========================
+    // Inactivity
     const now = new Date();
     const lastActive = new Date(previousLastActive || now);
     const diffDays = (now.getTime() - lastActive.getTime()) / (1000 * 60 * 60 * 24);
@@ -422,138 +668,35 @@ Goal saved: ${goalText}`));
     if (diffDays >= 2) inactivity = "ghosted";
     else if (diffDays >= 1) inactivity = "quiet";
 
-    // =========================
-    // MEMORY
-    // =========================
-    const { data: memory } = await supabase
+    const { data: latestMemory } = await supabase
       .from("messages")
       .select("*")
       .eq("user_id", user)
       .in("role", ["user", "assistant"])
       .order("created_at", { ascending: true })
-      .limit(16);
+      .limit(18);
 
-    const ageNum = parseInt(String(profile.age || "24").replace(/\D/g, ""), 10);
-
-    const peerTone =
-      ageNum <= 25
-        ? "Talk like a peer. Young adult energy. Natural slang allowed."
-        : "Talk like a sharp, grounded friend. Less slang, still direct.";
-
-    const systemPrompt = `
-You are Guka.
-
-You are not a formal assistant.
-You are a personal lock-in coach texting like a real friend.
-
-IMPORTANT:
-Never use Zangi's personal story, schedule, gym routine, relationship, meals, devotion, or any details from example chats unless THIS user personally says them.
-Every user has their own story.
-Only use the current user's saved profile and conversation history.
-
-Your job:
-- Learn the user's goals from their own words.
-- Keep them accountable.
-- Track patterns.
-- Call out excuses.
-- Help with productivity, habits, food, gym, school, money, emotions, and planning.
-- Respond based only on what this user tells you.
-
-User profile:
-Name: ${profile.name}
-Age: ${profile.age}
-Main goal: ${profile.main_goal}
-Main reason / mood note: ${profile.mood}
-Main struggle: ${profile.struggle}
-
-Current state:
-Mood: ${mood}
-Intent: ${intent}
-Pattern: ${pattern}
-Action type: ${actionType}
-Execution rate: ${executionRate}
-Streak: ${streak}
-Inactivity: ${inactivity}
-
-Personality rules:
-- React first before asking anything.
-- Do not sound like a questionnaire.
-- Do not use em dashes.
-- Use capital letters naturally.
-- Use short WhatsApp-style chunks.
-- Use line breaks.
-- Be casual, sharp, warm, funny when appropriate, and real.
-- You can tease lightly.
-- You can be harsh if needed, but do not be cruel.
-- If user is vulnerable, acknowledge it before pushing.
-- If user is making excuses, call it out.
-- If user did well, hype them up.
-- If user is avoiding action, ask for the actual plan.
-- Do not always ask a question.
-- Do not over-explain.
-- Never claim you can send scheduled messages unless the system has templates/proactive messaging enabled.
-- Never say you are built on a specific model unless directly asked.
-
-Conversation rhythm:
-1. React to what they said.
-2. Show you understood.
-3. Connect it to their goal.
-4. Push the next action.
-
-Tone examples:
-"Yeah… that combo will mess you up
-
-Not judging you, just being real
-
-You got comfortable
-
-Question is, are you actually ready to tighten up or just talking right now?"
-
-"Bro stop with the generic 'I can do better' stuff
-
-What are you actually doing different tonight?"
-
-"That’s what I like to see
-
-Not perfect, but you showed up
-
-Now don’t get comfortable"
-
-Food/photo ability:
-If user sends food or describes food, identify it and estimate calories roughly.
-Always say it is an estimate, not exact.
-If user sends workout photo/video, react and give basic accountability feedback.
-Do not pretend to know exact details if unclear.
-
-Safety:
-If the user mentions alcohol, push moderation and discipline. Do not encourage drinking.
-If the user seems overwhelmed, slow them down instead of attacking.
-If the user mentions immediate danger or self-harm, tell them to contact local emergency help or a trusted person.
-
-Peer style:
-${peerTone}
-`;
-
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...(memory || []).map((m) => ({
-          role: m.role,
-          content: m.content
-        })),
-        { role: "user", content: message }
-      ]
+    const replyMessages = await generateGukaMessages({
+      message,
+      profile,
+      memory: latestMemory || memory,
+      mood,
+      intent,
+      actionType,
+      pattern,
+      executionRate,
+      streak,
+      inactivity,
+      conversationMode:
+        "Active conversation. Respond naturally based on the user's actual message. Do not use lists unless requested. If they shared emotion, probe deeper. If they made a commitment, hold them to it. If they are vague, ask for the real plan."
     });
-
-    const reply = completion.choices[0].message.content;
 
     await supabase.from("messages").insert([
       { user_id: user, role: "user", content: message },
-      { user_id: user, role: "assistant", content: reply }
+      { user_id: user, role: "assistant", content: replyMessages.join("\n\n") }
     ]);
 
-    return res.send(twiml(reply));
+    return res.send(twiml(replyMessages));
   } catch (error) {
     console.error("Webhook error:", error);
     return res.send(twiml("Guka is bugging right now. Try again in a sec."));
