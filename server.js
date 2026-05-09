@@ -4,6 +4,7 @@ require("dotenv").config();
 
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
+const axios = require("axios");
 
 const app = express();
 
@@ -32,9 +33,21 @@ function twiml(message) {
   return `<Response><Message>${escapeXml(message)}</Message></Response>`;
 }
 
-function isGreeting(message) {
-  return /^(hi|hello|hey|yo|sup|what'?s good|howzit|safe|bless)$/i.test(
-    message.trim()
+function cleanMessage(message) {
+  return (message || "").trim();
+}
+
+function isIntroQuestion(message) {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("what even is guka") ||
+    msg.includes("what is guka") ||
+    msg.includes("who is guka") ||
+    msg.includes("what even is tomo") ||
+    msg === "hi" ||
+    msg === "hey" ||
+    msg === "yo" ||
+    msg === "hello"
   );
 }
 
@@ -51,7 +64,7 @@ Return JSON only:
 {
   "mood": "lazy | stressed | confident | confused | emotional | neutral",
   "action": "action_commit | action_done | no_action",
-  "intent": "food | workout | relationship | schedule | reminder | accountability | normal"
+  "intent": "food | workout | relationship | school | money | schedule | reminder | accountability | normal"
 }
 `
         },
@@ -69,32 +82,44 @@ Return JSON only:
   }
 }
 
-async function analyzeImage(mediaUrl, caption) {
+async function analyzeImageFromTwilio(mediaUrl, caption) {
   try {
+    const response = await axios.get(mediaUrl, {
+      responseType: "arraybuffer",
+      auth: {
+        username: process.env.TWILIO_ACCOUNT_SID,
+        password: process.env.TWILIO_AUTH_TOKEN
+      }
+    });
+
+    const contentType = response.headers["content-type"] || "image/jpeg";
+    const base64Image = Buffer.from(response.data).toString("base64");
+    const dataUrl = `data:${contentType};base64,${base64Image}`;
+
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
           content: `
-You are Guka analyzing a WhatsApp image.
+You are Guka analyzing an image sent on WhatsApp.
 
 If it is food:
-- Identify the food
-- Estimate calories as a rough range
-- Mention uncertainty
-- Give one short practical note
+- Identify the food.
+- Estimate calories as a rough range.
+- Say it is an estimate, not exact.
+- Give one practical comment.
 
 If it is gym/workout:
-- React like an accountability coach
-- If visible, comment on effort/setup
-- Do NOT give medical advice
+- React like an accountability coach.
+- Mention effort/setup if visible.
+- Do not pretend to know details you cannot see.
 
-Style:
-- WhatsApp style
-- Short lines
-- Real friend energy
-- No em dashes
+Tone:
+- Real friend energy.
+- Short WhatsApp-style lines.
+- No em dashes.
+- No robotic nutrition lecture.
 `
         },
         {
@@ -102,13 +127,11 @@ Style:
           content: [
             {
               type: "text",
-              text:
-                caption ||
-                "Analyze this image like Guka. If food, estimate calories roughly."
+              text: caption || "Analyze this image like Guka."
             },
             {
               type: "image_url",
-              image_url: { url: mediaUrl }
+              image_url: { url: dataUrl }
             }
           ]
         }
@@ -118,19 +141,21 @@ Style:
     return completion.choices[0].message.content;
   } catch (error) {
     console.error("Image analysis error:", error);
-    return "I see the image came through, but I couldn’t analyze it properly. Send it again with a quick caption.";
+    return "I got the image, but I couldn’t read it properly. Send it again with a quick caption.";
   }
 }
 
 app.post("/webhook", async (req, res) => {
   try {
     const user = req.body.From || "";
-    const message = (req.body.Body || "").trim();
+    const message = cleanMessage(req.body.Body);
     const numMedia = Number(req.body.NumMedia || 0);
     const mediaUrl = numMedia > 0 ? req.body.MediaUrl0 : null;
     const mediaType = numMedia > 0 ? req.body.MediaContentType0 || "" : "";
 
-    if (!user) return res.send(twiml("Something’s off with your number. Try again."));
+    if (!user) {
+      return res.send(twiml("Something’s off with your number. Try again."));
+    }
 
     let { data: profile } = await supabase
       .from("user_profiles")
@@ -142,7 +167,7 @@ app.post("/webhook", async (req, res) => {
       await supabase.from("user_profiles").insert([
         {
           user_id: user,
-          step: "name",
+          step: "intro",
           onboarding_complete: false,
           last_active: new Date().toISOString(),
           updated_at: new Date().toISOString()
@@ -151,7 +176,7 @@ app.post("/webhook", async (req, res) => {
 
       profile = {
         user_id: user,
-        step: "name",
+        step: "intro",
         onboarding_complete: false
       };
     }
@@ -166,11 +191,8 @@ app.post("/webhook", async (req, res) => {
       })
       .eq("user_id", user);
 
-    // =========================
-    // IMAGE HANDLING
-    // =========================
     if (mediaUrl && mediaType.startsWith("image/") && profile.onboarding_complete) {
-      const imageReply = await analyzeImage(mediaUrl, message);
+      const imageReply = await analyzeImageFromTwilio(mediaUrl, message);
 
       await supabase.from("messages").insert([
         { user_id: user, role: "user", content: message || "[image]" },
@@ -181,56 +203,65 @@ app.post("/webhook", async (req, res) => {
     }
 
     // =========================
-    // ONBOARDING
+    // GENERALIZED ONBOARDING
     // =========================
     if (!profile.onboarding_complete) {
       let reply = "";
       let updates = {};
-      let nextStep = profile.step || "name";
+      let nextStep = profile.step || "intro";
 
-      if (nextStep === "name") {
-        if (isGreeting(message)) {
-          reply = `Yo 🤨
+      if (nextStep === "intro") {
+        nextStep = "name";
+
+        reply = `Yo 🤨
 
 Another person tryna lock in huh?
 
-I’ll get to that, but first what’s your name?`;
-        } else {
-          updates.name = message;
-          nextStep = "age";
+I’ll explain in a sec, but first what’s your name?`;
+      }
 
-          reply = `${message}?? okay that’s different, I like it
+      else if (nextStep === "name") {
+        updates.name = message;
+        nextStep = "age";
 
-Wait also how old are you?`;
-        }
+        reply = `${message}?? okay, I see you
+
+Wait also, how old are you?
+
+Not being weird, relax`;
       }
 
       else if (nextStep === "age") {
         updates.age = message;
         nextStep = "goal";
 
-        const ageNum = parseInt(message.replace(/\D/g, ""), 10);
+        reply = `Bet
 
-        if (ageNum && ageNum <= 25) {
-          reply = `Okay, so you’re at that age where life can either start getting serious or stay messy
+So tell me what you’re actually tryna fix, build, or improve right now
 
-What are you actually trying to improve right now?`;
-        } else {
-          reply = `Bet
-
-So what are you trying to fix or build right now?`;
-        }
+Could be school, money, fitness, discipline, relationships, whatever`;
       }
 
       else if (nextStep === "goal") {
         updates.main_goal = message;
+        nextStep = "reason";
+
+        reply = `Okay now we’re getting somewhere
+
+But why does that actually matter to you?
+
+Like what’s the real reason behind it`;
+      }
+
+      else if (nextStep === "reason") {
+        updates.mood = message;
         nextStep = "struggle";
 
-        reply = `Okay now we’re talking
+        reply = `That makes sense
 
-That’s not small either
+But be real with me now
 
-So be real with me, what’s been stopping you?`;
+What’s been stopping you from already being that version of yourself?`;
       }
 
       else if (nextStep === "struggle") {
@@ -242,9 +273,9 @@ So be real with me, what’s been stopping you?`;
 
 Not judging you, just being real
 
-You already know what’s been pulling you off track
+That’s the pattern we need to break
 
-Now we fix it`;
+Now we lock in`;
       }
 
       updates.step = nextStep;
@@ -268,7 +299,7 @@ Now we fix it`;
     profile = refreshedProfile || profile;
 
     // =========================
-    // BASIC GOAL COMMANDS
+    // COMMANDS
     // =========================
     if (message.toLowerCase().startsWith("goal:")) {
       const goalText = message.replace(/goal:/i, "").trim();
@@ -281,11 +312,9 @@ Now we fix it`;
         }
       ]);
 
-      return res.send(
-        twiml(`Locked in.
+      return res.send(twiml(`Locked.
 
-Goal saved: ${goalText}`)
-      );
+Goal saved: ${goalText}`));
     }
 
     if (message.toLowerCase().includes("my goals")) {
@@ -296,7 +325,7 @@ Goal saved: ${goalText}`)
         .eq("status", "active");
 
       if (!goals || goals.length === 0) {
-        return res.send(twiml("You don’t have goals saved yet. Send one like: goal: gym 5x a week"));
+        return res.send(twiml("You don’t have saved goals yet. Send one like:\n\ngoal: gym 5x a week"));
       }
 
       const list = goals.map((g, i) => `${i + 1}. ${g.goal}`).join("\n");
@@ -305,7 +334,7 @@ Goal saved: ${goalText}`)
     }
 
     // =========================
-    // CLASSIFICATION
+    // CLASSIFY MESSAGE
     // =========================
     const analysis = await classifyMessage(message);
     const mood = analysis.mood || "neutral";
@@ -371,6 +400,7 @@ Goal saved: ${goalText}`)
         const yesterday = new Date();
         yesterday.setDate(yesterday.getDate() - 1);
         const yDate = yesterday.toISOString().split("T")[0];
+
         streak = lastDate === yDate ? streak + 1 : 1;
       }
 
@@ -408,25 +438,32 @@ Goal saved: ${goalText}`)
     const peerTone =
       ageNum <= 25
         ? "Talk like a peer. Young adult energy. Natural slang allowed."
-        : "Talk like a sharp older friend. Less slang, still direct.";
+        : "Talk like a sharp, grounded friend. Less slang, still direct.";
 
     const systemPrompt = `
 You are Guka.
 
-You are NOT a formal assistant.
+You are not a formal assistant.
 You are a personal lock-in coach texting like a real friend.
 
+IMPORTANT:
+Never use Zangi's personal story, schedule, gym routine, relationship, meals, devotion, or any details from example chats unless THIS user personally says them.
+Every user has their own story.
+Only use the current user's saved profile and conversation history.
+
 Your job:
-Keep the user accountable.
-Track their goals.
-Call out excuses.
-React emotionally when needed.
-Help them plan, eat, train, sleep, study, and stay consistent.
+- Learn the user's goals from their own words.
+- Keep them accountable.
+- Track patterns.
+- Call out excuses.
+- Help with productivity, habits, food, gym, school, money, emotions, and planning.
+- Respond based only on what this user tells you.
 
 User profile:
 Name: ${profile.name}
 Age: ${profile.age}
 Main goal: ${profile.main_goal}
+Main reason / mood note: ${profile.mood}
 Main struggle: ${profile.struggle}
 
 Current state:
@@ -442,27 +479,28 @@ Personality rules:
 - React first before asking anything.
 - Do not sound like a questionnaire.
 - Do not use em dashes.
-- Start sentences naturally. Capital letters are allowed.
+- Use capital letters naturally.
 - Use short WhatsApp-style chunks.
 - Use line breaks.
-- Be casual, sharp, warm, and sometimes funny.
+- Be casual, sharp, warm, funny when appropriate, and real.
 - You can tease lightly.
-- You can be harsh if the user asked for it, but do not be cruel.
-- If user is vulnerable, acknowledge it first before pushing.
+- You can be harsh if needed, but do not be cruel.
+- If user is vulnerable, acknowledge it before pushing.
 - If user is making excuses, call it out.
 - If user did well, hype them up.
 - If user is avoiding action, ask for the actual plan.
 - Do not always ask a question.
 - Do not over-explain.
-- Never say you are an AI model unless directly asked.
+- Never claim you can send scheduled messages unless the system has templates/proactive messaging enabled.
+- Never say you are built on a specific model unless directly asked.
 
 Conversation rhythm:
 1. React to what they said.
-2. Show you understood the situation.
+2. Show you understood.
 3. Connect it to their goal.
 4. Push the next action.
 
-Examples of tone:
+Tone examples:
 "Yeah… that combo will mess you up
 
 Not judging you, just being real
@@ -488,9 +526,9 @@ If user sends workout photo/video, react and give basic accountability feedback.
 Do not pretend to know exact details if unclear.
 
 Safety:
-If the user mentions alcohol, don’t encourage drinking. Push moderation and discipline.
+If the user mentions alcohol, push moderation and discipline. Do not encourage drinking.
 If the user seems overwhelmed, slow them down instead of attacking.
-If the user is in immediate danger, tell them to contact local emergency help or a trusted person.
+If the user mentions immediate danger or self-harm, tell them to contact local emergency help or a trusted person.
 
 Peer style:
 ${peerTone}
